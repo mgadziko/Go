@@ -1035,14 +1035,14 @@ final class GoGameViewModel: ObservableObject {
             ? (adjacentEnemyBefore - adjacentOwnBefore) * 95
             : 0
         let openingExpansionBonus = openingLikely
-            ? ((occupiedAdjacentBefore == 0 ? 120 : 0) + max(0, 2 - occupiedAdjacentBefore) * 24)
+            ? ((occupiedAdjacentBefore == 0 ? 160 : 0) + max(0, 2 - occupiedAdjacentBefore) * 30)
             : 0
         let openingEdgePenalty: Int
         if openingLikely && capturesGained == 0 && adjacentEnemyBefore == 0 {
             if localEdgeDist == 0 {
-                openingEdgePenalty = 330
+                openingEdgePenalty = 420
             } else if localEdgeDist == 1 {
-                openingEdgePenalty = 130
+                openingEdgePenalty = 190
             } else {
                 openingEdgePenalty = 0
             }
@@ -1235,14 +1235,14 @@ final class GoGameViewModel: ObservableObject {
             ? (adjacentEnemyBefore - adjacentOwnBefore) * 95
             : 0
         let openingExpansionBonus = openingLikely
-            ? ((occupiedAdjacentBefore == 0 ? 120 : 0) + max(0, 2 - occupiedAdjacentBefore) * 24)
+            ? ((occupiedAdjacentBefore == 0 ? 160 : 0) + max(0, 2 - occupiedAdjacentBefore) * 30)
             : 0
         let openingEdgePenalty: Int
         if openingLikely && capturesGained == 0 && adjacentEnemyBefore == 0 {
             if localEdgeDist == 0 {
-                openingEdgePenalty = 330
+                openingEdgePenalty = 420
             } else if localEdgeDist == 1 {
-                openingEdgePenalty = 130
+                openingEdgePenalty = 190
             } else {
                 openingEdgePenalty = 0
             }
@@ -1818,6 +1818,7 @@ final class GoGameViewModel: ObservableObject {
             let adjacentEmptyBefore = neighborIndexTable[pointIndex].reduce(into: 0) { total, n in
                 if state.board[n] == 0 { total += 1 }
             }
+            let occupiedAdjacentBefore = adjacentEnemyBefore + adjacentOwnBefore
             let selfAtariPenalty = (ownLiberties <= 1 && capturesGained == 0) ? 500 : 0
             let thinPenalty = ownLiberties == 2 ? 14 : 0
             let selfFillNoTactics =
@@ -1832,15 +1833,18 @@ final class GoGameViewModel: ObservableObject {
             let openingEdgePenalty: Int
             if openingLikely && capturesGained == 0 && adjacentEnemyBefore == 0 {
                 if localEdgeDist == 0 {
-                    openingEdgePenalty = 220
+                    openingEdgePenalty = 300
                 } else if localEdgeDist == 1 {
-                    openingEdgePenalty = 85
+                    openingEdgePenalty = 130
                 } else {
                     openingEdgePenalty = 0
                 }
             } else {
                 openingEdgePenalty = 0
             }
+            let openingExpansionBonus = openingLikely
+                ? ((occupiedAdjacentBefore == 0 ? 70 : 0) + max(0, 2 - occupiedAdjacentBefore) * 16)
+                : 0
             let openingSelfFillPenalty =
                 (openingLikely &&
                  capturesGained == 0 &&
@@ -1853,6 +1857,7 @@ final class GoGameViewModel: ObservableObject {
             let score =
                 capturesGained * 170 +
                 captureCompletionBonus +
+                openingExpansionBonus +
                 ownLiberties * 5 -
                 selfAtariPenalty -
                 openingEdgePenalty -
@@ -2450,9 +2455,9 @@ final class GoGameViewModel: ObservableObject {
                 : 0
             let edgeLinePenalty: Int
             if adjacentEnemy == 0 && localEdgeDist == 0 {
-                edgeLinePenalty = totalStones <= (boardSize <= 9 ? 10 : 16) ? 230 : 140
+                edgeLinePenalty = totalStones <= (boardSize <= 9 ? 10 : 16) ? 300 : 190
             } else if adjacentEnemy == 0 && localEdgeDist == 1 && ownStoneCount > 0 {
-                edgeLinePenalty = 60
+                edgeLinePenalty = 95
             } else {
                 edgeLinePenalty = 0
             }
@@ -2460,12 +2465,17 @@ final class GoGameViewModel: ObservableObject {
                 (adjacentEnemy == 0 && adjacentOwn >= 2 && adjacentEmpty <= 1)
                 ? 185
                 : 0
+            let spaciousExpansionBonus =
+                (adjacentEnemy == 0 && localEdgeDist >= preferredLine)
+                ? (minDist * 12 + (adjacentEmpty * 8))
+                : 0
 
             return
                 (clampedDist * 20) +
                 (adjacentEmpty * 14) +
                 lineBonus +
                 earlyCornerBias +
+                spaciousExpansionBonus +
                 extensionBonus -
                 overconcentrationPenalty -
                 contactPenalty -
@@ -2568,9 +2578,9 @@ final class GoGameViewModel: ObservableObject {
                 : 0
             let edgeLinePenalty: Int
             if adjacentEnemy == 0 && localEdgeDist == 0 {
-                edgeLinePenalty = totalStones <= (size <= 9 ? 10 : 16) ? 230 : 140
+                edgeLinePenalty = totalStones <= (size <= 9 ? 10 : 16) ? 300 : 190
             } else if adjacentEnemy == 0 && localEdgeDist == 1 && ownStoneCount > 0 {
-                edgeLinePenalty = 60
+                edgeLinePenalty = 95
             } else {
                 edgeLinePenalty = 0
             }
@@ -2578,12 +2588,17 @@ final class GoGameViewModel: ObservableObject {
                 (adjacentEnemy == 0 && adjacentOwn >= 2 && adjacentEmpty <= 1)
                 ? 185
                 : 0
+            let spaciousExpansionBonus =
+                (adjacentEnemy == 0 && localEdgeDist >= preferredLine)
+                ? (minDist * 12 + (adjacentEmpty * 8))
+                : 0
 
             return
                 (clampedDist * 20) +
                 (adjacentEmpty * 14) +
                 lineBonus +
                 earlyCornerBias +
+                spaciousExpansionBonus +
                 extensionBonus -
                 overconcentrationPenalty -
                 contactPenalty -
