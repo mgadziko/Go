@@ -38,6 +38,17 @@ struct ContentView: View {
                 }
                 .disabled(!game.canPauseAI() && !game.isAIPaused)
                 .fixedSize(horizontal: true, vertical: false)
+
+                Toggle("Show AI Strategy", isOn: $game.showStrategyEnabled)
+                    .toggleStyle(.switch)
+                    .fixedSize(horizontal: true, vertical: false)
+
+#if DEBUG
+                Button("Ko Self-Test") {
+                    game.runKoRegressionHarness()
+                }
+                .fixedSize(horizontal: true, vertical: false)
+#endif
             }
 
             HStack(spacing: 16) {
@@ -68,16 +79,14 @@ struct ContentView: View {
                 }
                 .frame(width: 160)
 
-                Toggle("Tactical Mode", isOn: $game.tacticalModeEnabled)
+                Toggle("Deeper Tactics", isOn: $game.tacticalModeEnabled)
                     .toggleStyle(.switch)
                     .fixedSize(horizontal: true, vertical: false)
             }
 
             HStack(spacing: 24) {
                 Label("Black captures: \(game.capturesBlack)", systemImage: "circle.fill")
-                    .foregroundStyle(.black)
                 Label("White captures: \(game.capturesWhite)", systemImage: "circle.fill")
-                    .foregroundStyle(.gray)
                 Text("Black territory: \(game.territoryBlack)")
                 Text("White territory: \(game.territoryWhite)")
             }
@@ -88,7 +97,7 @@ struct ContentView: View {
                 Text("Turn time: \(game.formattedCurrentTurnTime())")
                 Text(game.gameOver
                      ? "Game over"
-                     : "\(game.currentPlayer == .black ? "Black" : "White") to move")
+                     : "\(game.currentPlayer == .black ? "Black's" : "White's") turn")
                 if game.isAIThinking && !game.isAIPaused {
                     HStack(spacing: 6) {
                         ProgressView()
@@ -98,8 +107,10 @@ struct ContentView: View {
                 }
             }
 
-            Text(game.statusMessage)
-                .font(.headline)
+            if game.statusMessage != "Black to move" && game.statusMessage != "White to move" {
+                Text(game.statusMessage)
+                    .font(.headline)
+            }
             
             if let blackScore = game.finalBlackScore, let whiteScore = game.finalWhiteScore {
                 HStack(spacing: 24) {
@@ -108,7 +119,7 @@ struct ContentView: View {
                 }
                 .font(.headline)
             }
-            
+
             GroupBox("History") {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 4) {
@@ -123,7 +134,12 @@ struct ContentView: View {
                 .frame(maxHeight: 140)
             }
 
-            GoBoardView(board: game.board) { row, col in
+            GoBoardView(
+                board: game.board,
+                strategyGhosts: game.showStrategyEnabled ? game.strategyGhosts : [],
+                lastMoveRow: game.lastMoveRow,
+                lastMoveCol: game.lastMoveCol
+            ) { row, col in
                 game.playHuman(row: row, col: col)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -134,6 +150,9 @@ struct ContentView: View {
 
 private struct GoBoardView: View {
     let board: [[Stone]]
+    var strategyGhosts: [StrategyGhostStone] = []
+    var lastMoveRow: Int?
+    var lastMoveCol: Int?
     var onTap: (Int, Int) -> Void
 
     var body: some View {
@@ -167,7 +186,14 @@ private struct GoBoardView: View {
                             Circle()
                                 .fill(board[row][col] == .black ? .black : .white)
                                 .overlay {
-                                    Circle().stroke(.black.opacity(0.3), lineWidth: 1)
+                                    ZStack {
+                                        Circle().stroke(.black.opacity(0.3), lineWidth: 1)
+                                        if row == lastMoveRow, col == lastMoveCol {
+                                            Circle()
+                                                .fill(Color.red)
+                                                .frame(width: step * 0.18, height: step * 0.18)
+                                        }
+                                    }
                                 }
                                 .frame(width: step * 0.82, height: step * 0.82)
                                 .position(
@@ -177,6 +203,23 @@ private struct GoBoardView: View {
                                 .shadow(radius: board[row][col] == .black ? 2 : 1)
                         }
                     }
+                }
+
+                ForEach(strategyGhosts) { ghost in
+                    Circle()
+                        .fill(ghost.stone == .black ? .black.opacity(ghost.kind == .best ? 0.60 : 0.32) : .white.opacity(ghost.kind == .best ? 0.70 : 0.40))
+                        .overlay {
+                            Circle()
+                                .stroke(
+                                    ghost.kind == .best ? Color.green.opacity(0.9) : Color.blue.opacity(0.7),
+                                    lineWidth: ghost.kind == .best ? 2.0 : 1.2
+                                )
+                        }
+                        .frame(width: step * 0.78, height: step * 0.78)
+                        .position(
+                            x: margin + CGFloat(ghost.col) * step,
+                            y: margin + CGFloat(ghost.row) * step
+                        )
                 }
             }
             .frame(width: size, height: size)
