@@ -714,11 +714,11 @@ final class GoGameViewModel: ObservableObject {
         let candidateLimit: Int
         switch aiStrength {
         case .fast:
-            candidateLimit = boardSize <= 9 ? 18 : 10
+            candidateLimit = boardSize <= 9 ? 18 : 8
         case .normal:
-            candidateLimit = boardSize <= 9 ? 28 : 16
+            candidateLimit = boardSize <= 9 ? 28 : 12
         case .strong:
-            candidateLimit = boardSize <= 9 ? 32 : 20
+            candidateLimit = boardSize <= 9 ? 32 : 14
         }
 
         let candidates = monteCarloCandidatesFast(
@@ -730,30 +730,43 @@ final class GoGameViewModel: ObservableObject {
 
         let baseSimulationsPerMove = boardSize <= 9 ? 36 : 14
         let baseRolloutDepth = boardSize <= 9 ? 120 : 180
+        let boardBudgetScale: Double = boardSize <= 9 ? 1.0 : 0.68
+        let boardDepthScale: Double = boardSize <= 9 ? 1.0 : 0.72
         let simulationsPerMove: Int
         let rolloutDepth: Int
         let tacticalWeight: Double
         let runTacticalLookahead: Bool
         switch aiStrength {
         case .fast:
-            simulationsPerMove = max(6, baseSimulationsPerMove / 2)
-            rolloutDepth = max(60, baseRolloutDepth / 2)
+            simulationsPerMove = max(4, Int(Double(baseSimulationsPerMove / 2) * boardBudgetScale))
+            rolloutDepth = max(48, Int(Double(baseRolloutDepth / 2) * boardDepthScale))
             tacticalWeight = 0
             runTacticalLookahead = false
         case .normal:
-            simulationsPerMove = baseSimulationsPerMove
-            rolloutDepth = baseRolloutDepth
+            simulationsPerMove = max(8, Int(Double(baseSimulationsPerMove) * boardBudgetScale))
+            rolloutDepth = max(90, Int(Double(baseRolloutDepth) * boardDepthScale))
             tacticalWeight = tacticalModeEnabled ? 0.7 : 0.5
             runTacticalLookahead = true
         case .strong:
-            simulationsPerMove = baseSimulationsPerMove * 2
-            rolloutDepth = baseRolloutDepth + (boardSize <= 9 ? 80 : 120)
+            simulationsPerMove = max(12, Int(Double(baseSimulationsPerMove * 2) * boardBudgetScale))
+            rolloutDepth = max(120, Int(Double(baseRolloutDepth + (boardSize <= 9 ? 80 : 120)) * boardDepthScale))
             tacticalWeight = tacticalModeEnabled ? 0.85 : 0.7
             runTacticalLookahead = true
         }
+        let hardMoveTimeCapSeconds: TimeInterval
+        switch aiStrength {
+        case .fast:
+            hardMoveTimeCapSeconds = boardSize <= 9 ? 5.0 : 7.0
+        case .normal:
+            hardMoveTimeCapSeconds = boardSize <= 9 ? 10.0 : 14.0
+        case .strong:
+            hardMoveTimeCapSeconds = boardSize <= 9 ? 15.0 : 20.0
+        }
+        let moveDeadline = ProcessInfo.processInfo.systemUptime + hardMoveTimeCapSeconds
 
         var best: (moveIndex: Int, score: Double)?
         var bestCandidate: FastCandidateMove?
+        let cpuCores = max(1, ProcessInfo.processInfo.activeProcessorCount)
 
         var shouldRunTacticalByIndex = Array(repeating: false, count: candidates.count)
         if runTacticalLookahead {
@@ -799,25 +812,31 @@ final class GoGameViewModel: ObservableObject {
         let optimisticTacticalCeiling = 90.0
         let pruneCheckInterval = 4
         let minRolloutsBeforePrune = 8
-        let totalSimulationBudget = max(candidates.count, simulationsPerMove * candidates.count)
+        let baseTotalBudget = max(candidates.count, simulationsPerMove * candidates.count)
+        let strategyOverheadScale = showStrategyEnabled ? 0.86 : 1.0
+        let totalSimulationBudget = max(candidates.count, Int(Double(baseTotalBudget) * strategyOverheadScale))
         let mctsBatchSize: Int
         let rolloutPreviewInterval: Int
         switch aiStrength {
         case .fast:
             mctsBatchSize = 2
-            rolloutPreviewInterval = 8
+            rolloutPreviewInterval = showStrategyEnabled ? 12 : 8
         case .normal:
             mctsBatchSize = 3
-            rolloutPreviewInterval = 6
+            rolloutPreviewInterval = showStrategyEnabled ? 10 : 6
         case .strong:
             mctsBatchSize = 4
-            rolloutPreviewInterval = 4
+            rolloutPreviewInterval = showStrategyEnabled ? 8 : 4
         }
         let livePreviewScoreDelta = 2.8
         let mctsExplorationConstant: Double = tacticalModeEnabled ? 1.15 : 1.05
         let confidenceIntervalScale: Double = tacticalModeEnabled ? 1.55 : 1.45
         let minSamplesForConfidenceStop = max(36, totalSimulationBudget / 4)
         let requiredConfidenceLead: Double = boardSize <= 9 ? 0.65 : 0.95
+        let shouldParallelizeRolloutBatches =
+            aiStrength != .fast &&
+            cpuCores >= 4 &&
+            candidates.count >= 4
 
         func shouldPublishInterimCandidate(
             interimCombined: Double,
@@ -857,6 +876,31 @@ final class GoGameViewModel: ObservableObject {
             )
         }
 
+        let tacticalPriorityLimit: Int
+        switch aiStrength {
+        case .fast:
+            tacticalPriorityLimit = 0
+        case .normal:
+            tacticalPriorityLimit = boardSize <= 9 ? 4 : 3
+        case .strong:
+            tacticalPriorityLimit = boardSize <= 9 ? 6 : 5
+        }
+        let tacticalPriorityIndices: Set<Int> = {
+            guard tacticalPriorityLimit > 0 else { return [] }
+            let sorted = children.indices.sorted {
+                let lhs = children[$0].candidate
+                let rhs = children[$1].candidate
+                if lhs.policyPrior == rhs.policyPrior {
+                    return lhs.immediateScore > rhs.immediateScore
+                }
+                return lhs.policyPrior > rhs.policyPrior
+            }
+            return Set(sorted.prefix(tacticalPriorityLimit).map { children[$0].candidateIndex })
+        }()
+        let minVisitsBeforeAnyTactical = max(16, totalSimulationBudget / 7)
+        let tacticalScoreWindow = tacticalModeEnabled ? 2.1 : 1.25
+        let tacticalVisitRankLimit = tacticalModeEnabled ? 3 : 2
+
         var totalVisits = 0
         let evalCache = threadLocalEvalCache()
 
@@ -892,12 +936,23 @@ final class GoGameViewModel: ObservableObject {
         func maybeComputeTactical(for index: Int) {
             guard children[index].runTactical else { return }
             guard !children[index].tacticalComputed else { return }
-            // Selective tactical lookahead: only fire for volatile lines and sufficiently sampled children.
+            guard tacticalPriorityIndices.contains(children[index].candidateIndex) else { return }
+            guard totalVisits >= minVisitsBeforeAnyTactical else { return }
+            // Selective tactical lookahead: only fire for top/volatile lines and sufficiently sampled children.
             let visitThreshold = tacticalModeEnabled ? 5 : 7
             if children[index].volatility <= 0 && children[index].visits < visitThreshold * 2 {
                 return
             }
             guard children[index].visits >= visitThreshold else { return }
+            let childCombined = combinedScore(children[index])
+            let bestCombined = best?.score ?? childCombined
+            guard childCombined >= (bestCombined - tacticalScoreWindow) else { return }
+            let betterVisitCount = children.indices.reduce(into: 0) { total, idx in
+                if children[idx].visits > children[index].visits {
+                    total += 1
+                }
+            }
+            guard betterVisitCount < tacticalVisitRankLimit else { return }
             let tactical = tacticalReplySwingFast(
                 for: children[index].candidate,
                 perspective: stoneCode(for: stone),
@@ -918,6 +973,9 @@ final class GoGameViewModel: ObservableObject {
 
         var playoutsUsed = 0
         while playoutsUsed < totalSimulationBudget {
+            if ProcessInfo.processInfo.systemUptime >= moveDeadline {
+                break
+            }
             let selectedIndex = children.indices.max {
                 upperConfidenceBound(children[$0], total: max(1, totalVisits + 1)) <
                 upperConfidenceBound(children[$1], total: max(1, totalVisits + 1))
@@ -927,17 +985,42 @@ final class GoGameViewModel: ObservableObject {
             let childRemaining = max(0, simulationsPerMove - children[selectedIndex].visits)
             let batch = max(1, min(mctsBatchSize, min(remainingBudget, childRemaining == 0 ? mctsBatchSize : childRemaining)))
 
-            let batchScore = runRandomPlayoutBatchFast(
-                from: children[selectedIndex].candidate.stateAfterMove,
-                perspective: stone,
-                maxSteps: rolloutDepth,
-                playoutCount: batch
-            )
+            let batchScore: Double
+            if shouldParallelizeRolloutBatches && batch >= 2 {
+                let workerCount = min(cpuCores, batch)
+                var subtotals = Array(repeating: 0.0, count: workerCount)
+                DispatchQueue.concurrentPerform(iterations: workerCount) { worker in
+                    var subtotal = 0.0
+                    var i = worker
+                    while i < batch {
+                        subtotal += runRandomPlayoutFast(
+                            from: children[selectedIndex].candidate.stateAfterMove,
+                            perspective: stone,
+                            maxSteps: rolloutDepth
+                        )
+                        i += workerCount
+                    }
+                    subtotals[worker] = subtotal
+                }
+                batchScore = subtotals.reduce(0, +)
+            } else {
+                batchScore = runRandomPlayoutBatchFast(
+                    from: children[selectedIndex].candidate.stateAfterMove,
+                    perspective: stone,
+                    maxSteps: rolloutDepth,
+                    playoutCount: batch
+                )
+            }
 
             children[selectedIndex].visits += batch
             children[selectedIndex].totalPlayout += batchScore
             playoutsUsed += batch
             totalVisits += batch
+
+            if ProcessInfo.processInfo.systemUptime >= moveDeadline {
+                updateBestFromChildren()
+                break
+            }
 
             maybeComputeTactical(for: selectedIndex)
             updateBestFromChildren()
@@ -4199,13 +4282,24 @@ final class GoGameViewModel: ObservableObject {
     ) -> Bool {
         let now = ProcessInfo.processInfo.systemUptime
         let minInterval: TimeInterval
-        switch aiStrength {
-        case .fast:
-            minInterval = 1.0 / 12.0
-        case .normal:
-            minInterval = 1.0 / 10.0
-        case .strong:
-            minInterval = 1.0 / 8.0
+        if isAIThinking {
+            switch aiStrength {
+            case .fast:
+                minInterval = 1.0 / 8.0
+            case .normal:
+                minInterval = 1.0 / 6.0
+            case .strong:
+                minInterval = 1.0 / 4.0
+            }
+        } else {
+            switch aiStrength {
+            case .fast:
+                minInterval = 1.0 / 12.0
+            case .normal:
+                minInterval = 1.0 / 10.0
+            case .strong:
+                minInterval = 1.0 / 8.0
+            }
         }
 
         strategyGhostPublishLock.lock()
