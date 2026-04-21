@@ -85,7 +85,7 @@ struct ContentView: View {
             }
 
             HStack(spacing: 20) {
-                Toggle("Show AI Strategy", isOn: $game.showStrategyEnabled)
+                Toggle("Show AI Thinking", isOn: $game.showStrategyEnabled)
                     .toggleStyle(.switch)
                     .fixedSize(horizontal: true, vertical: false)
 

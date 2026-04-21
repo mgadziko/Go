@@ -146,6 +146,8 @@ private final class SearchEvalCache {
 private final class RolloutThreadCache {
     var ownersByHash: [UInt64: [UInt8]] = [:]
     var preferredEmptyByHash: [UInt64: [Int]] = [:]
+    var openingLikelyByHash: [UInt64: Bool] = [:]
+    var endgameLikelyByHash: [UInt64: Bool] = [:]
     var visitMarks: [UInt32] = []
     var libertyMarks: [UInt32] = []
     var tempMarks: [UInt32] = []
@@ -159,6 +161,12 @@ private final class RolloutThreadCache {
         }
         if preferredEmptyByHash.count > 512 {
             preferredEmptyByHash.removeAll(keepingCapacity: true)
+        }
+        if openingLikelyByHash.count > 1024 {
+            openingLikelyByHash.removeAll(keepingCapacity: true)
+        }
+        if endgameLikelyByHash.count > 1024 {
+            endgameLikelyByHash.removeAll(keepingCapacity: true)
         }
     }
 
@@ -746,16 +754,6 @@ final class GoGameViewModel: ObservableObject {
 
         var best: (moveIndex: Int, score: Double)?
         var bestCandidate: FastCandidateMove?
-        let cpuCores = max(1, ProcessInfo.processInfo.activeProcessorCount)
-        let shouldParallelizeCandidates =
-            aiStrength != .fast &&
-            candidates.count >= 6 &&
-            simulationsPerMove >= 12
-        let shouldParallelizeRollouts =
-            aiStrength != .fast &&
-            !shouldParallelizeCandidates &&
-            simulationsPerMove >= 24 &&
-            cpuCores >= 4
 
         var shouldRunTacticalByIndex = Array(repeating: false, count: candidates.count)
         if runTacticalLookahead {
@@ -801,16 +799,25 @@ final class GoGameViewModel: ObservableObject {
         let optimisticTacticalCeiling = 90.0
         let pruneCheckInterval = 4
         let minRolloutsBeforePrune = 8
+        let totalSimulationBudget = max(candidates.count, simulationsPerMove * candidates.count)
+        let mctsBatchSize: Int
         let rolloutPreviewInterval: Int
         switch aiStrength {
         case .fast:
+            mctsBatchSize = 2
             rolloutPreviewInterval = 8
         case .normal:
+            mctsBatchSize = 3
             rolloutPreviewInterval = 6
         case .strong:
+            mctsBatchSize = 4
             rolloutPreviewInterval = 4
         }
         let livePreviewScoreDelta = 2.8
+        let mctsExplorationConstant: Double = tacticalModeEnabled ? 1.15 : 1.05
+        let confidenceIntervalScale: Double = tacticalModeEnabled ? 1.55 : 1.45
+        let minSamplesForConfidenceStop = max(36, totalSimulationBudget / 4)
+        let requiredConfidenceLead: Double = boardSize <= 9 ? 0.65 : 0.95
 
         func shouldPublishInterimCandidate(
             interimCombined: Double,
@@ -820,172 +827,183 @@ final class GoGameViewModel: ObservableObject {
             return interimCombined >= (bestScore - livePreviewScoreDelta)
         }
 
-        func combinedScore(
-            for candidate: FastCandidateMove,
-            candidateIndex: Int,
-            bestScoreSnapshot: () -> Double?,
-            bestMoveIndexSnapshot: () -> Int?
-        ) -> (average: Double, tactical: Double, combined: Double) {
-            let totalScore: Double
-            let completedRollouts: Int
-            if shouldParallelizeRollouts {
-                let workerCount = min(cpuCores, simulationsPerMove)
-                let totalLock = NSLock()
-                var aggregate = 0.0
-
-                DispatchQueue.concurrentPerform(iterations: workerCount) { worker in
-                    var subtotal = 0.0
-                    var simIndex = worker
-                    while simIndex < simulationsPerMove {
-                        subtotal += runRandomPlayoutFast(
-                            from: candidate.stateAfterMove,
-                            perspective: stone,
-                            maxSteps: rolloutDepth
-                        )
-                        simIndex += workerCount
-                    }
-                    totalLock.lock()
-                    aggregate += subtotal
-                    totalLock.unlock()
-                }
-                totalScore = aggregate
-                completedRollouts = simulationsPerMove
-            } else {
-                var sequentialTotal = 0.0
-                var completed = 0
-                let runTacticalForCandidate = runTacticalLookahead && shouldRunTacticalByIndex[candidateIndex]
-                let fixedHeuristicTerm =
-                    (Double(candidate.immediateScore) * 0.028) +
-                    (Double(candidate.capturesGained) * 1.15) +
-                    (candidate.policyPrior * 6.5)
-                for sim in 0..<simulationsPerMove {
-                    sequentialTotal += runRandomPlayoutFast(
-                        from: candidate.stateAfterMove,
-                        perspective: stone,
-                        maxSteps: rolloutDepth
-                    )
-                    completed += 1
-
-                    let completed = sim + 1
-                    if showStrategyEnabled &&
-                       (completed == 1 || completed % rolloutPreviewInterval == 0) {
-                        let interimAverage = sequentialTotal / Double(completed)
-                        let interimCombined = interimAverage + fixedHeuristicTerm
-                        let bestScore = bestScoreSnapshot()
-                        if shouldPublishInterimCandidate(
-                            interimCombined: interimCombined,
-                            bestScore: bestScore
-                        ) {
-                            publishContemplatedMoveFast(
-                                currentMove: candidate,
-                                bestMoveIndex: bestMoveIndexSnapshot(),
-                                stone: stone,
-                                token: searchToken,
-                                includePreviewLine: false
-                            )
-                        }
-                    }
-
-                    if completed < simulationsPerMove,
-                       completed >= minRolloutsBeforePrune,
-                       completed % pruneCheckInterval == 0,
-                       let bestSoFar = bestScoreSnapshot() {
-                        let remaining = simulationsPerMove - completed
-                        let optimisticAverage =
-                            (sequentialTotal + (Double(remaining) * optimisticPlayoutCeiling)) /
-                            Double(simulationsPerMove)
-                        let optimisticTactical = runTacticalForCandidate
-                            ? (optimisticTacticalCeiling * tacticalWeight)
-                            : 0
-                        let optimisticCombined =
-                            optimisticAverage +
-                            fixedHeuristicTerm +
-                            optimisticTactical
-                        if optimisticCombined <= bestSoFar {
-                            break
-                        }
-                    }
-                }
-                totalScore = sequentialTotal
-                completedRollouts = max(1, completed)
-            }
-
-            let average = totalScore / Double(completedRollouts)
-            let evalCache = threadLocalEvalCache()
-            let tacticalLookahead = (runTacticalLookahead && shouldRunTacticalByIndex[candidateIndex])
-                ? tacticalReplySwingFast(for: candidate, perspective: stoneCode(for: stone), cache: evalCache)
-                : 0
-            let combined =
-                average +
-                (Double(candidate.immediateScore) * 0.028) +
-                (Double(candidate.capturesGained) * 1.15) +
-                (candidate.policyPrior * 6.5) +
-                (tacticalLookahead * tacticalWeight)
-            return (average, tacticalLookahead, combined)
+        struct RootMCTSChild {
+            let candidate: FastCandidateMove
+            let candidateIndex: Int
+            let fixedTerm: Double
+            let runTactical: Bool
+            let volatility: Int
+            var visits: Int = 0
+            var totalPlayout: Double = 0
+            var tacticalLookahead: Double = 0
+            var tacticalComputed: Bool = false
         }
 
-        if shouldParallelizeCandidates {
-            let bestLock = NSLock()
-            DispatchQueue.concurrentPerform(iterations: candidates.count) { idx in
-                let candidate = candidates[idx]
-                let metrics = combinedScore(
-                    for: candidate,
-                    candidateIndex: idx,
-                    bestScoreSnapshot: {
-                        bestLock.lock()
-                        defer { bestLock.unlock() }
-                        return best?.score
-                    },
-                    bestMoveIndexSnapshot: {
-                        bestLock.lock()
-                        defer { bestLock.unlock() }
-                        return best?.moveIndex
-                    }
-                )
-                var bestMoveIndex: Int?
-                bestLock.lock()
-                if let existingBest = best, metrics.combined > existingBest.score {
-                    best = (candidate.index, metrics.combined)
-                    bestCandidate = candidate
-                } else if best == nil {
-                    best = (candidate.index, metrics.combined)
-                    bestCandidate = candidate
-                }
-                bestMoveIndex = best?.moveIndex
-                bestLock.unlock()
-                publishContemplatedMoveFast(
-                    currentMove: candidate,
-                    bestMoveIndex: bestMoveIndex,
-                    stone: stone,
-                    token: searchToken
-                )
+        var children: [RootMCTSChild] = candidates.enumerated().map { idx, candidate in
+            let fixedTerm =
+                (Double(candidate.immediateScore) * 0.028) +
+                (Double(candidate.capturesGained) * 1.15) +
+                (candidate.policyPrior * 6.5)
+            let volatility =
+                (candidate.capturesGained * 3) +
+                (candidate.selfFillNoTactics ? 0 : 1) +
+                (candidate.immediateScore > 300 ? 1 : 0)
+            return RootMCTSChild(
+                candidate: candidate,
+                candidateIndex: idx,
+                fixedTerm: fixedTerm,
+                runTactical: shouldRunTacticalByIndex[idx],
+                volatility: volatility
+            )
+        }
+
+        var totalVisits = 0
+        let evalCache = threadLocalEvalCache()
+
+        func meanPlayout(_ child: RootMCTSChild) -> Double {
+            guard child.visits > 0 else { return 0 }
+            return child.totalPlayout / Double(child.visits)
+        }
+
+        func combinedScore(_ child: RootMCTSChild) -> Double {
+            meanPlayout(child) + child.fixedTerm + (child.tacticalLookahead * tacticalWeight)
+        }
+
+        func upperConfidenceBound(_ child: RootMCTSChild, total: Int) -> Double {
+            let priorBoost = child.candidate.policyPrior * 0.7
+            if child.visits == 0 {
+                return child.fixedTerm + priorBoost + mctsExplorationConstant * 2.2
             }
-        } else {
-            for (idx, candidate) in candidates.enumerated() {
-                let metrics = combinedScore(
-                    for: candidate,
-                    candidateIndex: idx,
-                    bestScoreSnapshot: { best?.score },
-                    bestMoveIndexSnapshot: { best?.moveIndex }
-                )
-                if let best, metrics.combined <= best.score {
+            let explore =
+                mctsExplorationConstant *
+                (0.8 + child.candidate.policyPrior) *
+                sqrt(log(Double(max(total, 1)) + 1.0) / Double(child.visits))
+            return meanPlayout(child) + child.fixedTerm + (child.tacticalLookahead * tacticalWeight) + explore + priorBoost
+        }
+
+        func optimisticCombined(_ child: RootMCTSChild, remainingBudget: Int) -> Double {
+            let optimisticAverage =
+                (child.totalPlayout + (Double(remainingBudget) * optimisticPlayoutCeiling)) /
+                Double(max(1, child.visits + remainingBudget))
+            let optimisticTactical = child.runTactical ? (optimisticTacticalCeiling * tacticalWeight) : 0
+            return optimisticAverage + child.fixedTerm + optimisticTactical
+        }
+
+        func maybeComputeTactical(for index: Int) {
+            guard children[index].runTactical else { return }
+            guard !children[index].tacticalComputed else { return }
+            // Selective tactical lookahead: only fire for volatile lines and sufficiently sampled children.
+            let visitThreshold = tacticalModeEnabled ? 5 : 7
+            if children[index].volatility <= 0 && children[index].visits < visitThreshold * 2 {
+                return
+            }
+            guard children[index].visits >= visitThreshold else { return }
+            let tactical = tacticalReplySwingFast(
+                for: children[index].candidate,
+                perspective: stoneCode(for: stone),
+                cache: evalCache
+            )
+            children[index].tacticalLookahead = tactical
+            children[index].tacticalComputed = true
+        }
+
+        func updateBestFromChildren() {
+            guard let bestIndex = children.indices.max(by: { combinedScore(children[$0]) < combinedScore(children[$1]) }) else {
+                return
+            }
+            let score = combinedScore(children[bestIndex])
+            best = (children[bestIndex].candidate.index, score)
+            bestCandidate = children[bestIndex].candidate
+        }
+
+        var playoutsUsed = 0
+        while playoutsUsed < totalSimulationBudget {
+            let selectedIndex = children.indices.max {
+                upperConfidenceBound(children[$0], total: max(1, totalVisits + 1)) <
+                upperConfidenceBound(children[$1], total: max(1, totalVisits + 1))
+            } ?? 0
+
+            let remainingBudget = totalSimulationBudget - playoutsUsed
+            let childRemaining = max(0, simulationsPerMove - children[selectedIndex].visits)
+            let batch = max(1, min(mctsBatchSize, min(remainingBudget, childRemaining == 0 ? mctsBatchSize : childRemaining)))
+
+            let batchScore = runRandomPlayoutBatchFast(
+                from: children[selectedIndex].candidate.stateAfterMove,
+                perspective: stone,
+                maxSteps: rolloutDepth,
+                playoutCount: batch
+            )
+
+            children[selectedIndex].visits += batch
+            children[selectedIndex].totalPlayout += batchScore
+            playoutsUsed += batch
+            totalVisits += batch
+
+            maybeComputeTactical(for: selectedIndex)
+            updateBestFromChildren()
+
+            if showStrategyEnabled,
+               let bestMoveIndex = best?.moveIndex,
+               (children[selectedIndex].visits == batch ||
+                children[selectedIndex].visits % rolloutPreviewInterval == 0) {
+                let interim = combinedScore(children[selectedIndex])
+                if shouldPublishInterimCandidate(interimCombined: interim, bestScore: best?.score) {
                     publishContemplatedMoveFast(
-                        currentMove: candidate,
-                        bestMoveIndex: best.moveIndex,
+                        currentMove: children[selectedIndex].candidate,
+                        bestMoveIndex: bestMoveIndex,
                         stone: stone,
-                        token: searchToken
+                        token: searchToken,
+                        includePreviewLine: false
                     )
+                }
+            }
+
+            if children[selectedIndex].visits >= minRolloutsBeforePrune &&
+               children[selectedIndex].visits % pruneCheckInterval == 0,
+               let bestScore = best?.score {
+                let optimistic = optimisticCombined(children[selectedIndex], remainingBudget: remainingBudget)
+                if optimistic < bestScore - 0.1 {
                     continue
                 }
-                best = (candidate.index, metrics.combined)
-                bestCandidate = candidate
-                publishContemplatedMoveFast(
-                    currentMove: candidate,
-                    bestMoveIndex: best?.moveIndex,
-                    stone: stone,
-                    token: searchToken
-                )
             }
+
+            // Confidence-gap early stop: if best line is statistically clear, end search early.
+            if totalVisits >= minSamplesForConfidenceStop,
+               children.count > 1,
+               let bestIdx = children.indices.max(by: { combinedScore(children[$0]) < combinedScore(children[$1]) }) {
+                var secondIdx: Int?
+                for idx in children.indices where idx != bestIdx {
+                    if secondIdx == nil || combinedScore(children[idx]) > combinedScore(children[secondIdx!]) {
+                        secondIdx = idx
+                    }
+                }
+                if let secondIdx,
+                   children[bestIdx].visits >= 8,
+                   children[secondIdx].visits >= 8 {
+                    let totalLog = log(Double(totalVisits) + 1.0)
+                    let bestRadius =
+                        confidenceIntervalScale *
+                        sqrt(totalLog / Double(max(1, children[bestIdx].visits)))
+                    let secondRadius =
+                        confidenceIntervalScale *
+                        sqrt(totalLog / Double(max(1, children[secondIdx].visits)))
+                    let bestLower = combinedScore(children[bestIdx]) - bestRadius
+                    let secondUpper = combinedScore(children[secondIdx]) + secondRadius
+                    if bestLower - secondUpper > requiredConfidenceLead {
+                        break
+                    }
+                }
+            }
+        }
+
+        if let bestMoveIndex = best?.moveIndex,
+           let currentBest = bestCandidate {
+            publishContemplatedMoveFast(
+                currentMove: currentBest,
+                bestMoveIndex: bestMoveIndex,
+                stone: stone,
+                token: searchToken
+            )
         }
 
         if let bestCandidate,
@@ -2450,8 +2468,21 @@ final class GoGameViewModel: ObservableObject {
     }
 
     private func runRandomPlayoutFast(from state: FastSimState, perspective: Stone, maxSteps: Int) -> Double {
+        runRandomPlayoutFast(
+            from: state,
+            perspective: perspective,
+            maxSteps: maxSteps,
+            rolloutCache: threadLocalRolloutCache()
+        )
+    }
+
+    private func runRandomPlayoutFast(
+        from state: FastSimState,
+        perspective: Stone,
+        maxSteps: Int,
+        rolloutCache: RolloutThreadCache
+    ) -> Double {
         var sim = state
-        let rolloutCache = threadLocalRolloutCache()
         var steps = 0
 
         while steps < maxSteps, sim.consecutivePasses < 2 {
@@ -2471,6 +2502,26 @@ final class GoGameViewModel: ObservableObject {
             return blackScore - whiteScore
         }
         return whiteScore - blackScore
+    }
+
+    private func runRandomPlayoutBatchFast(
+        from state: FastSimState,
+        perspective: Stone,
+        maxSteps: Int,
+        playoutCount: Int
+    ) -> Double {
+        guard playoutCount > 0 else { return 0 }
+        let rolloutCache = threadLocalRolloutCache()
+        var total = 0.0
+        for _ in 0..<playoutCount {
+            total += runRandomPlayoutFast(
+                from: state,
+                perspective: perspective,
+                maxSteps: maxSteps,
+                rolloutCache: rolloutCache
+            )
+        }
+        return total
     }
 
     private func randomLegalMove(in state: SimState) -> Point? {
@@ -2840,6 +2891,11 @@ final class GoGameViewModel: ObservableObject {
     }
 
     private func isLikelyEndgameFast(state: FastSimState) -> Bool {
+        let boardHash = state.currentBoardHash ?? hash(forFastBoard: state.board)
+        let cache = threadLocalRolloutCache()
+        if let cached = cache.endgameLikelyByHash[boardHash] {
+            return state.consecutivePasses > 0 ? true : cached
+        }
         let emptyCount = state.board.reduce(into: 0) { count, value in
             if value == 0 { count += 1 }
         }
@@ -2847,7 +2903,9 @@ final class GoGameViewModel: ObservableObject {
         if state.consecutivePasses > 0 {
             return true
         }
-        return emptyCount <= max(10, totalPoints / 4)
+        let computed = emptyCount <= max(10, totalPoints / 4)
+        cache.endgameLikelyByHash[boardHash] = computed
+        return computed
     }
 
     private func applyFastPass(to state: inout FastSimState) {
@@ -3271,11 +3329,18 @@ final class GoGameViewModel: ObservableObject {
 
     private func isLikelyOpeningFast(state: FastSimState) -> Bool {
         if state.consecutivePasses > 0 { return false }
+        let boardHash = state.currentBoardHash ?? hash(forFastBoard: state.board)
+        let cache = threadLocalRolloutCache()
+        if let cached = cache.openingLikelyByHash[boardHash] {
+            return cached
+        }
         let occupied = state.board.reduce(into: 0) { count, value in
             if value != 0 { count += 1 }
         }
         let totalPoints = boardSize * boardSize
-        return occupied <= max(10, totalPoints / 8)
+        let computed = occupied <= max(10, totalPoints / 8)
+        cache.openingLikelyByHash[boardHash] = computed
+        return computed
     }
 
     private func localToPoint(
@@ -4133,7 +4198,15 @@ final class GoGameViewModel: ObservableObject {
         bestMove: (row: Int, col: Int)?
     ) -> Bool {
         let now = ProcessInfo.processInfo.systemUptime
-        let minInterval = 1.0 / 12.0 // ~12 FPS throttle
+        let minInterval: TimeInterval
+        switch aiStrength {
+        case .fast:
+            minInterval = 1.0 / 12.0
+        case .normal:
+            minInterval = 1.0 / 10.0
+        case .strong:
+            minInterval = 1.0 / 8.0
+        }
 
         strategyGhostPublishLock.lock()
         defer { strategyGhostPublishLock.unlock() }
