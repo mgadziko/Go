@@ -3288,9 +3288,46 @@ final class GoGameViewModel: ObservableObject {
         let afterFirstPass = root.consecutivePasses > 0
         let passScore = staticBoardScore(for: perspective, in: root, cache: cache)
         let moveScore = staticBoardScore(for: perspective, in: candidate.stateAfterMove, cache: cache)
+        let movePoint = Point(row: candidate.row, col: candidate.col)
 
         if endgameLikely && afterFirstPass && candidate.selfFillNoTactics {
             return moveScore <= passScore + 0.25
+        }
+
+        if endgameLikely {
+            let ownEyeFill = isOwnEye(at: movePoint, stone: perspective, in: root.board)
+            let rootOpponentThreat = maxImmediateCapture(
+                for: perspective.opposite,
+                in: root,
+                sampleLimit: boardSize <= 9 ? 24 : 16
+            )
+            let moveOpponentThreat = maxImmediateCapture(
+                for: perspective.opposite,
+                in: candidate.stateAfterMove,
+                sampleLimit: boardSize <= 9 ? 24 : 16
+            )
+            let defensiveGain = rootOpponentThreat - moveOpponentThreat
+            let noTacticalBenefit =
+                candidate.capturesGained == 0 &&
+                defensiveGain <= 0
+            // In endgame, pass over neutral/noise moves that do not improve position.
+            if noTacticalBenefit {
+                let tinyGain = moveScore - passScore
+                if afterFirstPass && tinyGain <= 0.20 {
+                    return true
+                }
+                let totalPoints = boardSize * boardSize
+                let emptyCount = root.board.reduce(into: 0) { total, row in
+                    for stone in row where stone == .empty { total += 1 }
+                }
+                let veryLate = emptyCount <= max(6, totalPoints / 8)
+                if veryLate && rootOpponentThreat <= 1 && tinyGain <= 0.35 {
+                    return true
+                }
+            }
+            if noTacticalBenefit && (candidate.selfFillNoTactics || ownEyeFill) {
+                return moveScore <= passScore + 0.55
+            }
         }
 
         return shouldHopelessLateGamePass(
@@ -3313,9 +3350,49 @@ final class GoGameViewModel: ObservableObject {
         let afterFirstPass = root.consecutivePasses > 0
         let passScore = staticBoardScoreFast(for: perspective, in: root, cache: cache)
         let moveScore = staticBoardScoreFast(for: perspective, in: candidate.stateAfterMove, cache: cache)
+        let ownEyeFill = isOwnEyeFast(at: candidate.index, stone: perspective, in: root.board)
 
         if endgameLikely && afterFirstPass && candidate.selfFillNoTactics {
             return moveScore <= passScore + 0.25
+        }
+
+        if endgameLikely {
+            let rolloutCache = threadLocalRolloutCache()
+            let opponent: UInt8 = perspective == 1 ? 2 : 1
+            let rootOpponentThreat = maxImmediateCaptureFast(
+                for: opponent,
+                in: root,
+                sampleLimit: boardSize <= 9 ? 24 : 16,
+                cache: rolloutCache
+            )
+            let moveOpponentThreat = maxImmediateCaptureFast(
+                for: opponent,
+                in: candidate.stateAfterMove,
+                sampleLimit: boardSize <= 9 ? 24 : 16,
+                cache: rolloutCache
+            )
+            let defensiveGain = rootOpponentThreat - moveOpponentThreat
+            let noTacticalBenefit =
+                candidate.capturesGained == 0 &&
+                defensiveGain <= 0
+            // In endgame, pass over neutral/noise moves that do not improve position.
+            if noTacticalBenefit {
+                let tinyGain = moveScore - passScore
+                if afterFirstPass && tinyGain <= 0.20 {
+                    return true
+                }
+                let totalPoints = boardSize * boardSize
+                let emptyCount = root.board.reduce(into: 0) { total, value in
+                    if value == 0 { total += 1 }
+                }
+                let veryLate = emptyCount <= max(6, totalPoints / 8)
+                if veryLate && rootOpponentThreat <= 1 && tinyGain <= 0.35 {
+                    return true
+                }
+            }
+            if noTacticalBenefit && (candidate.selfFillNoTactics || ownEyeFill) {
+                return moveScore <= passScore + 0.55
+            }
         }
 
         return shouldHopelessLateGamePassFast(
