@@ -851,6 +851,7 @@ final class GoGameViewModel: ObservableObject {
             let candidateIndex: Int
             let fixedTerm: Double
             let runTactical: Bool
+            let tacticalUrgency: Int
             let volatility: Int
             var visits: Int = 0
             var totalPlayout: Double = 0
@@ -858,13 +859,38 @@ final class GoGameViewModel: ObservableObject {
             var tacticalComputed: Bool = false
         }
 
+        let rolloutCache = threadLocalRolloutCache()
+        let rootOpponentThreat = maxImmediateCaptureFast(
+            for: stoneCode(for: stone.opposite),
+            in: root,
+            sampleLimit: boardSize <= 9 ? 24 : 16,
+            cache: rolloutCache
+        )
+
         var children: [RootMCTSChild] = candidates.enumerated().map { idx, candidate in
+            let candidateOpponentThreat = maxImmediateCaptureFast(
+                for: stoneCode(for: stone.opposite),
+                in: candidate.stateAfterMove,
+                sampleLimit: boardSize <= 9 ? 20 : 14,
+                cache: rolloutCache
+            )
+            let defensiveGain = max(0, rootOpponentThreat - candidateOpponentThreat)
+            let tacticalUrgency =
+                (candidate.capturesGained * 2) +
+                (defensiveGain * 2) +
+                ((defensiveGain > 0 && candidate.capturesGained == 0) ? 1 : 0)
+            let urgencyBonus =
+                (Double(candidate.capturesGained) * 2.4) +
+                (Double(defensiveGain) * 2.0) +
+                ((defensiveGain > 0 && candidate.capturesGained == 0) ? 1.25 : 0)
             let fixedTerm =
                 (Double(candidate.immediateScore) * 0.028) +
                 (Double(candidate.capturesGained) * 1.15) +
-                (candidate.policyPrior * 6.5)
+                (candidate.policyPrior * 6.5) +
+                urgencyBonus
             let volatility =
                 (candidate.capturesGained * 3) +
+                (defensiveGain * 2) +
                 (candidate.selfFillNoTactics ? 0 : 1) +
                 (candidate.immediateScore > 300 ? 1 : 0)
             return RootMCTSChild(
@@ -872,6 +898,7 @@ final class GoGameViewModel: ObservableObject {
                 candidateIndex: idx,
                 fixedTerm: fixedTerm,
                 runTactical: shouldRunTacticalByIndex[idx],
+                tacticalUrgency: tacticalUrgency,
                 volatility: volatility
             )
         }
@@ -895,7 +922,12 @@ final class GoGameViewModel: ObservableObject {
                 }
                 return lhs.policyPrior > rhs.policyPrior
             }
-            return Set(sorted.prefix(tacticalPriorityLimit).map { children[$0].candidateIndex })
+            var selected = Set(sorted.prefix(tacticalPriorityLimit).map { children[$0].candidateIndex })
+            // Always include urgent tactical lines (captures/defenses) for lookahead.
+            for child in children where child.tacticalUrgency > 0 {
+                selected.insert(child.candidateIndex)
+            }
+            return selected
         }()
         let minVisitsBeforeAnyTactical = max(16, totalSimulationBudget / 7)
         let tacticalScoreWindow = tacticalModeEnabled ? 2.1 : 1.25
@@ -1144,6 +1176,11 @@ final class GoGameViewModel: ObservableObject {
                 capturesGained = simulated.capturesBlack - root.capturesBlack
             } else {
                 capturesGained = simulated.capturesWhite - root.capturesWhite
+            }
+
+            // Hard filter: avoid eye-filling/self-filling dead-end moves with no tactical purpose.
+            if capturesGained == 0 && immediate.selfFillNoTactics && immediate.score <= -2000 {
+                continue
             }
 
             let policyRaw = policyPriorRawFast(
