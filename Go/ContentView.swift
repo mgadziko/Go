@@ -39,10 +39,6 @@ struct ContentView: View {
                 .disabled(!game.canPauseAI() && !game.isAIPaused)
                 .fixedSize(horizontal: true, vertical: false)
 
-                Toggle("Show AI Strategy", isOn: $game.showStrategyEnabled)
-                    .toggleStyle(.switch)
-                    .fixedSize(horizontal: true, vertical: false)
-
 #if DEBUG
                 Button("Ko Self-Test") {
                     game.runKoRegressionHarness()
@@ -79,7 +75,25 @@ struct ContentView: View {
                 }
                 .frame(width: 160)
 
+                Picker("Capture Reading", selection: $game.captureReadingStrength) {
+                    ForEach(CaptureReadingStrength.allCases) { strength in
+                        Text(strength.rawValue).tag(strength)
+                    }
+                }
+                .frame(width: 210)
+
+            }
+
+            HStack(spacing: 20) {
+                Toggle("Show AI Strategy", isOn: $game.showStrategyEnabled)
+                    .toggleStyle(.switch)
+                    .fixedSize(horizontal: true, vertical: false)
+
                 Toggle("Deeper Tactics", isOn: $game.tacticalModeEnabled)
+                    .toggleStyle(.switch)
+                    .fixedSize(horizontal: true, vertical: false)
+
+                Toggle("Joseki Boost", isOn: $game.josekiBookEnabled)
                     .toggleStyle(.switch)
                     .fixedSize(horizontal: true, vertical: false)
             }
@@ -206,16 +220,57 @@ private struct GoBoardView: View {
                 }
 
                 ForEach(strategyGhosts) { ghost in
+                    let fillOpacity: Double = {
+                        switch ghost.kind {
+                        case .current:
+                            return ghost.stone == .black ? 0.32 : 0.40
+                        case .best:
+                            return ghost.stone == .black ? 0.60 : 0.70
+                        case .opponentResponse:
+                            return ghost.stone == .black ? 0.44 : 0.56
+                        case .aiFollowUp:
+                            return ghost.stone == .black ? 0.28 : 0.36
+                        }
+                    }()
+                    let strokeColor: Color = {
+                        switch ghost.kind {
+                        case .current:
+                            return Color.blue.opacity(0.7)
+                        case .best:
+                            return Color.green.opacity(0.9)
+                        case .opponentResponse:
+                            return Color.orange.opacity(0.9)
+                        case .aiFollowUp:
+                            return Color.cyan.opacity(0.9)
+                        }
+                    }()
+                    let strokeWidth: CGFloat = {
+                        switch ghost.kind {
+                        case .best:
+                            return 2.0
+                        case .opponentResponse:
+                            return 1.7
+                        case .aiFollowUp:
+                            return 1.5
+                        case .current:
+                            return 1.2
+                        }
+                    }()
+                    let sizeFactor: CGFloat = {
+                        switch ghost.kind {
+                        case .aiFollowUp:
+                            return 0.72
+                        default:
+                            return 0.78
+                        }
+                    }()
                     Circle()
-                        .fill(ghost.stone == .black ? .black.opacity(ghost.kind == .best ? 0.60 : 0.32) : .white.opacity(ghost.kind == .best ? 0.70 : 0.40))
+                        .fill(ghost.stone == .black ? .black.opacity(fillOpacity) : .white.opacity(fillOpacity))
                         .overlay {
                             Circle()
-                                .stroke(
-                                    ghost.kind == .best ? Color.green.opacity(0.9) : Color.blue.opacity(0.7),
-                                    lineWidth: ghost.kind == .best ? 2.0 : 1.2
-                                )
+                                .stroke(strokeColor, lineWidth: strokeWidth)
                         }
-                        .frame(width: step * 0.78, height: step * 0.78)
+                        .frame(width: step * sizeFactor, height: step * sizeFactor)
                         .position(
                             x: margin + CGFloat(ghost.col) * step,
                             y: margin + CGFloat(ghost.row) * step
