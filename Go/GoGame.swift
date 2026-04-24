@@ -127,6 +127,7 @@ enum StrategyGhostKind: Hashable {
     case best
     case opponentResponse
     case aiFollowUp
+    case trail(Int)
 }
 
 struct StrategyGhostStone: Identifiable, Hashable {
@@ -143,6 +144,12 @@ private struct StaticEvalKey: Hashable {
     let capturesBlack: Int
     let capturesWhite: Int
     let perspective: Stone
+}
+
+private struct ImmediateCaptureKey: Hashable {
+    let boardHash: UInt64
+    let stone: UInt8
+    let sampleLimit: Int
 }
 
 private final class SearchEvalCache {
@@ -165,6 +172,7 @@ private final class RolloutThreadCache {
     var preferredEmptyByHash: [UInt64: [Int]] = [:]
     var openingLikelyByHash: [UInt64: Bool] = [:]
     var endgameLikelyByHash: [UInt64: Bool] = [:]
+    var immediateCaptureByKey: [ImmediateCaptureKey: Int] = [:]
     var visitMarks: [UInt32] = []
     var libertyMarks: [UInt32] = []
     var tempMarks: [UInt32] = []
@@ -184,6 +192,9 @@ private final class RolloutThreadCache {
         }
         if endgameLikelyByHash.count > 1024 {
             endgameLikelyByHash.removeAll(keepingCapacity: true)
+        }
+        if immediateCaptureByKey.count > 2048 {
+            immediateCaptureByKey.removeAll(keepingCapacity: true)
         }
     }
 
@@ -319,6 +330,7 @@ final class GoGameViewModel: ObservableObject {
     private var strategyGhostLastPublishUptime: TimeInterval = 0
     private var strategyGhostLastCurrent: (row: Int, col: Int)?
     private var strategyGhostLastBest: (row: Int, col: Int)?
+    private var strategyGhostTrail: [(row: Int, col: Int)] = []
     private var learningBook = StrategyLearningBook()
     private var learningTrace: [LearningTraceEntry] = []
     private let learningLock = NSLock()
@@ -1057,13 +1069,15 @@ final class GoGameViewModel: ObservableObject {
                 let workerCount = min(cpuCores, batch)
                 var subtotals = Array(repeating: 0.0, count: workerCount)
                 DispatchQueue.concurrentPerform(iterations: workerCount) { worker in
+                    let workerCache = threadLocalRolloutCache()
                     var subtotal = 0.0
                     var i = worker
                     while i < batch {
                         subtotal += runRandomPlayoutFast(
                             from: children[selectedIndex].candidate.stateAfterMove,
                             perspective: stone,
-                            maxSteps: rolloutDepth
+                            maxSteps: rolloutDepth,
+                            rolloutCache: workerCache
                         )
                         i += workerCount
                     }
@@ -1093,9 +1107,7 @@ final class GoGameViewModel: ObservableObject {
             updateBestFromChildren()
 
             if showStrategyEnabled,
-               let bestMoveIndex = best?.moveIndex,
-               (children[selectedIndex].visits == batch ||
-                children[selectedIndex].visits % rolloutPreviewInterval == 0) {
+               let bestMoveIndex = best?.moveIndex {
                 let interim = combinedScore(children[selectedIndex])
                 if shouldPublishInterimCandidate(interimCombined: interim, bestScore: best?.score) {
                     let includePreviewSequence =
@@ -1180,11 +1192,11 @@ final class GoGameViewModel: ObservableObject {
     ) -> [FastCandidateMove] {
         var prelim: [(index: Int, immediateScore: Int, capturesGained: Int, selfFillNoTactics: Bool, stateAfterMove: FastSimState, policyRaw: Double)] = []
         let learningBoardHash = root.currentBoardHash ?? hash(forFastBoard: root.board)
-        let ownersBeforeMove = emptyRegionOwnersFast(in: root.board)
+        let cache = threadLocalRolloutCache()
+        let ownersBeforeMove = emptyRegionOwnersFast(in: root.board, boardHash: learningBoardHash, cache: cache)
         let endgameLikely = isLikelyEndgameFast(state: root)
         let openingLikely = isLikelyOpeningFast(state: root)
         let afterFirstPass = root.consecutivePasses > 0
-        let cache = threadLocalRolloutCache()
         let koRecapturePending = hasKoRecaptureOpportunityFast(
             for: stone,
             in: root,
@@ -1192,11 +1204,11 @@ final class GoGameViewModel: ObservableObject {
         )
         let candidateIndices = openingLikely
             ? openingExpansionIndicesFast(in: root.board, for: stone)
-            : preferredEmptyIndicesFast(in: root.board)
+            : preferredEmptyIndicesFast(in: root.board, boardHash: learningBoardHash, cache: cache)
 
         for index in candidateIndices {
             var simulated = root
-            guard applyFastSimMove(at: index, to: &simulated) else { continue }
+            guard applyFastSimMove(at: index, to: &simulated, cache: cache) else { continue }
 
             let immediate = immediateHeuristicFast(
                 from: root,
@@ -1204,6 +1216,7 @@ final class GoGameViewModel: ObservableObject {
                 moveIndex: index,
                 stone: stone,
                 ownerBeforeMove: ownersBeforeMove[index],
+                ownersBeforeMove: ownersBeforeMove,
                 endgameLikely: endgameLikely,
                 openingLikely: openingLikely,
                 afterFirstPass: afterFirstPass,
@@ -1315,6 +1328,7 @@ final class GoGameViewModel: ObservableObject {
         moveIndex: Int,
         stone: UInt8,
         ownerBeforeMove: UInt8,
+        ownersBeforeMove: [UInt8],
         endgameLikely: Bool,
         openingLikely: Bool,
         afterFirstPass: Bool,
@@ -1475,6 +1489,19 @@ final class GoGameViewModel: ObservableObject {
         } else {
             midgameCenterExpansionBonus = 0
         }
+        let territoryFrontierScore = openingLikely ? 0 : territoryFrontierScoreFast(
+            moveIndex: moveIndex,
+            stone: stone,
+            ownerBeforeMove: ownerBeforeMove,
+            ownersBeforeMove: ownersBeforeMove,
+            board: root.board,
+            capturesGained: capturesGained,
+            enemyAtariAfter: enemyAtariAfter,
+            ownAtariBefore: ownAtariBefore,
+            adjacentOwnBefore: adjacentOwnBefore,
+            adjacentEnemyBefore: adjacentEnemyBefore,
+            adjacentEmptyBefore: adjacentEmptyBefore
+        )
         let openingSelfFillPenalty =
              (openingLikely &&
              capturesGained == 0 &&
@@ -1483,6 +1510,14 @@ final class GoGameViewModel: ObservableObject {
              adjacentEmptyBefore <= 1 &&
              enemyAtariAfter == 0)
             ? 320
+            : 0
+        let openingOwnAdjacencyPenalty =
+            (openingLikely &&
+             capturesGained == 0 &&
+             adjacentEnemyBefore == 0 &&
+             adjacentOwnBefore > 0 &&
+             enemyAtariAfter == 0)
+            ? (120 + adjacentOwnBefore * 80)
             : 0
         let tacticalReadingBonus = localTacticalReadingBonusFast(
             from: root,
@@ -1526,6 +1561,7 @@ final class GoGameViewModel: ObservableObject {
             captureCompletionBonus +
             openingExpansionBonus +
             midgameCenterExpansionBonus +
+            territoryFrontierScore +
             eyeProgressBonus +
             ownAtariBefore * 85 +
             enemyAtariAfter * 28 +
@@ -1537,6 +1573,7 @@ final class GoGameViewModel: ObservableObject {
             openingEdgePenalty -
             midgameEdgePenalty -
             openingSelfFillPenalty -
+            openingOwnAdjacencyPenalty -
             ownTerritoryFillPenalty +
             koTakeBonus +
             koThreatBonus +
@@ -1580,6 +1617,7 @@ final class GoGameViewModel: ObservableObject {
                 move: point,
                 for: stone,
                 ownerBeforeMove: ownersBeforeMove[point.row][point.col],
+                ownersBeforeMove: ownersBeforeMove,
                 endgameLikely: endgameLikely,
                 openingLikely: openingLikely,
                 afterFirstPass: afterFirstPass,
@@ -1737,6 +1775,12 @@ final class GoGameViewModel: ObservableObject {
             raw += Double(max(0, 4 - abs(edgeDist - preferredLine))) * 0.45
             if adjacentEnemy > adjacentOwn && capturesGained == 0 { raw -= 0.95 }
             if adjacentEnemy == 0 { raw += 0.35 }
+            if capturesGained == 0 && adjacentEnemy == 0 && adjacentOwn > 0 {
+                raw -= Double(adjacentOwn) * 0.85
+            }
+            if capturesGained == 0 && adjacentEnemy == 0 && adjacentOwn == 0 {
+                raw += 0.55
+            }
         } else if !endgameLikely {
             if capturesGained == 0 && adjacentEnemy == 0 {
                 if edgeDist == 0 {
@@ -1791,6 +1835,12 @@ final class GoGameViewModel: ObservableObject {
             raw += Double(max(0, 4 - abs(edgeDist - preferredLine))) * 0.45
             if adjacentEnemy > adjacentOwn && capturesGained == 0 { raw -= 0.95 }
             if adjacentEnemy == 0 { raw += 0.35 }
+            if capturesGained == 0 && adjacentEnemy == 0 && adjacentOwn > 0 {
+                raw -= Double(adjacentOwn) * 0.85
+            }
+            if capturesGained == 0 && adjacentEnemy == 0 && adjacentOwn == 0 {
+                raw += 0.55
+            }
         } else if !endgameLikely {
             if capturesGained == 0 && adjacentEnemy == 0 {
                 if edgeDist == 0 {
@@ -1809,6 +1859,156 @@ final class GoGameViewModel: ObservableObject {
             moveIndex: move.row * boardSize + move.col
         )
         return raw
+    }
+
+    private func territoryFrontierScoreFast(
+        moveIndex: Int,
+        stone: UInt8,
+        ownerBeforeMove: UInt8,
+        ownersBeforeMove: [UInt8],
+        board: [UInt8],
+        capturesGained: Int,
+        enemyAtariAfter: Int,
+        ownAtariBefore: Int,
+        adjacentOwnBefore: Int,
+        adjacentEnemyBefore: Int,
+        adjacentEmptyBefore: Int
+    ) -> Int {
+        guard capturesGained == 0, enemyAtariAfter == 0, ownAtariBefore == 0 else { return 0 }
+
+        let opponent: UInt8 = stone == 1 ? 2 : 1
+        var contestedEmptyAdjacent = 0
+        var opponentOwnedEmptyAdjacent = 0
+        var ownOwnedEmptyAdjacent = 0
+
+        for neighbor in neighborIndexTable[moveIndex] where board[neighbor] == 0 {
+            let owner = ownersBeforeMove[neighbor]
+            if owner == 0 {
+                contestedEmptyAdjacent += 1
+            } else if owner == opponent {
+                opponentOwnedEmptyAdjacent += 1
+            } else if owner == stone {
+                ownOwnedEmptyAdjacent += 1
+            }
+        }
+
+        let row = moveIndex / boardSize
+        let col = moveIndex % boardSize
+        let edgeDist = min(min(row, boardSize - 1 - row), min(col, boardSize - 1 - col))
+        let quietInterior =
+            ownerBeforeMove == stone &&
+            adjacentEnemyBefore == 0 &&
+            adjacentOwnBefore >= 2 &&
+            adjacentEmptyBefore <= 2
+
+        if quietInterior {
+            var penalty = 420 + (adjacentOwnBefore * 80) + max(0, 2 - adjacentEmptyBefore) * 90
+            if contestedEmptyAdjacent == 0 && opponentOwnedEmptyAdjacent == 0 {
+                penalty += 220
+            }
+            if edgeDist == 0 {
+                penalty += 120
+            }
+            return -penalty
+        }
+
+        if ownerBeforeMove == 0 {
+            var bonus = 0
+            if adjacentOwnBefore > 0 && (adjacentEnemyBefore > 0 || opponentOwnedEmptyAdjacent > 0 || contestedEmptyAdjacent > 0) {
+                bonus += 240 + adjacentEmptyBefore * 30
+            }
+            if adjacentOwnBefore > 0 && adjacentEnemyBefore > 0 {
+                bonus += 170
+            }
+            if edgeDist == 0 && adjacentOwnBefore > 0 && adjacentEnemyBefore > 0 {
+                bonus += 100
+            }
+            if ownOwnedEmptyAdjacent > 0 && (contestedEmptyAdjacent > 0 || opponentOwnedEmptyAdjacent > 0) {
+                bonus += 90
+            }
+            return bonus
+        }
+
+        if ownerBeforeMove == opponent && adjacentOwnBefore > 0 {
+            return 150 + (adjacentEnemyBefore * 55) + (opponentOwnedEmptyAdjacent * 35)
+        }
+
+        return 0
+    }
+
+    private func territoryFrontierScore(
+        move: Point,
+        stone: Stone,
+        ownerBeforeMove: Stone?,
+        ownersBeforeMove: [[Stone?]],
+        board: [[Stone]],
+        capturesGained: Int,
+        enemyAtariAfter: Int,
+        ownAtariBefore: Int,
+        adjacentOwnBefore: Int,
+        adjacentEnemyBefore: Int,
+        adjacentEmptyBefore: Int
+    ) -> Int {
+        guard capturesGained == 0, enemyAtariAfter == 0, ownAtariBefore == 0 else { return 0 }
+
+        var contestedEmptyAdjacent = 0
+        var opponentOwnedEmptyAdjacent = 0
+        var ownOwnedEmptyAdjacent = 0
+
+        for neighbor in neighbors(of: move) where board[neighbor.row][neighbor.col] == .empty {
+            let owner = ownersBeforeMove[neighbor.row][neighbor.col]
+            if owner == nil {
+                contestedEmptyAdjacent += 1
+            } else if owner == stone.opposite {
+                opponentOwnedEmptyAdjacent += 1
+            } else if owner == stone {
+                ownOwnedEmptyAdjacent += 1
+            }
+        }
+
+        let edgeDist = min(
+            min(move.row, boardSize - 1 - move.row),
+            min(move.col, boardSize - 1 - move.col)
+        )
+        let quietInterior =
+            ownerBeforeMove == stone &&
+            adjacentEnemyBefore == 0 &&
+            adjacentOwnBefore >= 2 &&
+            adjacentEmptyBefore <= 2
+
+        if quietInterior {
+            var penalty = 420 + (adjacentOwnBefore * 80) + max(0, 2 - adjacentEmptyBefore) * 90
+            if contestedEmptyAdjacent == 0 && opponentOwnedEmptyAdjacent == 0 {
+                penalty += 220
+            }
+            if edgeDist == 0 {
+                penalty += 120
+            }
+            return -penalty
+        }
+
+        if ownerBeforeMove == nil {
+            var bonus = 0
+            if adjacentOwnBefore > 0 && (adjacentEnemyBefore > 0 || opponentOwnedEmptyAdjacent > 0 || contestedEmptyAdjacent > 0) {
+                bonus += 240 + adjacentEmptyBefore * 30
+            }
+            if adjacentOwnBefore > 0 && adjacentEnemyBefore > 0 {
+                bonus += 170
+            }
+            if edgeDist == 0 && adjacentOwnBefore > 0 && adjacentEnemyBefore > 0 {
+                bonus += 100
+            }
+            if ownOwnedEmptyAdjacent > 0 && (contestedEmptyAdjacent > 0 || opponentOwnedEmptyAdjacent > 0) {
+                bonus += 90
+            }
+            return bonus
+        }
+
+        if ownerBeforeMove == stone.opposite && adjacentOwnBefore > 0 {
+            return 150 + (adjacentEnemyBefore * 55) + (opponentOwnedEmptyAdjacent * 35)
+        }
+
+        return 0
     }
 
     private func preferredEmptyPoints(in position: [[Stone]]) -> [Point] {
@@ -1861,6 +2061,7 @@ final class GoGameViewModel: ObservableObject {
         move: Point,
         for stone: Stone,
         ownerBeforeMove: Stone?,
+        ownersBeforeMove: [[Stone?]],
         endgameLikely: Bool,
         openingLikely: Bool,
         afterFirstPass: Bool,
@@ -2015,6 +2216,19 @@ final class GoGameViewModel: ObservableObject {
         } else {
             midgameCenterExpansionBonus = 0
         }
+        let territoryFrontierScore = openingLikely ? 0 : territoryFrontierScore(
+            move: move,
+            stone: stone,
+            ownerBeforeMove: ownerBeforeMove,
+            ownersBeforeMove: ownersBeforeMove,
+            board: root.board,
+            capturesGained: capturesGained,
+            enemyAtariAfter: enemyAtariAfter,
+            ownAtariBefore: ownAtariBefore,
+            adjacentOwnBefore: adjacentOwnBefore,
+            adjacentEnemyBefore: adjacentEnemyBefore,
+            adjacentEmptyBefore: adjacentEmptyBefore
+        )
         let openingSelfFillPenalty =
             (openingLikely &&
              capturesGained == 0 &&
@@ -2023,6 +2237,14 @@ final class GoGameViewModel: ObservableObject {
              adjacentEmptyBefore <= 1 &&
              enemyAtariAfter == 0)
             ? 320
+            : 0
+        let openingOwnAdjacencyPenalty =
+            (openingLikely &&
+             capturesGained == 0 &&
+             adjacentEnemyBefore == 0 &&
+             adjacentOwnBefore > 0 &&
+             enemyAtariAfter == 0)
+            ? (120 + adjacentOwnBefore * 80)
             : 0
         let deadShapePenalty = deadShapeRiskPenalty(
             move: move,
@@ -2053,6 +2275,7 @@ final class GoGameViewModel: ObservableObject {
             captureCompletionBonus +
             openingExpansionBonus +
             midgameCenterExpansionBonus +
+            territoryFrontierScore +
             eyeProgressBonus +
             ownAtariBefore * 85 +
             enemyAtariAfter * 28 +
@@ -2064,6 +2287,7 @@ final class GoGameViewModel: ObservableObject {
             openingEdgePenalty -
             midgameEdgePenalty -
             openingSelfFillPenalty -
+            openingOwnAdjacencyPenalty -
             koTakePenalty -
             koIgnorePenalty -
             deadShapePenalty +
@@ -2437,8 +2661,20 @@ final class GoGameViewModel: ObservableObject {
         probe.currentPlayer = stone
 
         let probeHash = probe.currentBoardHash ?? hash(forFastBoard: probe.board)
+        let cacheKey = ImmediateCaptureKey(
+            boardHash: probeHash,
+            stone: stone,
+            sampleLimit: sampleLimit
+        )
+        if let cached = cache.immediateCaptureByKey[cacheKey] {
+            return cached
+        }
+
         let points = preferredEmptyIndicesFast(in: probe.board, boardHash: probeHash, cache: cache)
-        if points.isEmpty { return 0 }
+        if points.isEmpty {
+            cache.immediateCaptureByKey[cacheKey] = 0
+            return 0
+        }
 
         var best = 0
         for point in points.prefix(sampleLimit) {
@@ -2454,6 +2690,7 @@ final class GoGameViewModel: ObservableObject {
                 best = gained
             }
         }
+        cache.immediateCaptureByKey[cacheKey] = best
         return best
     }
 
@@ -3030,6 +3267,14 @@ final class GoGameViewModel: ObservableObject {
             let openingExpansionBonus = openingLikely
                 ? ((occupiedAdjacentBefore == 0 ? 72 : 0) + max(0, 2 - occupiedAdjacentBefore) * 16)
                 : 0
+            let openingOwnAdjacencyPenalty =
+                (openingLikely &&
+                 capturesGained == 0 &&
+                 adjacentEnemyBefore == 0 &&
+                 adjacentOwnBefore > 0 &&
+                 enemyAtariAfter == 0)
+                ? (80 + adjacentOwnBefore * 55)
+                : 0
             let localEdgeDist = min(
                 min(point.row, boardSize - 1 - point.row),
                 min(point.col, boardSize - 1 - point.col)
@@ -3054,11 +3299,25 @@ final class GoGameViewModel: ObservableObject {
                  localEdgeDist >= 2)
                 ? (44 + localEdgeDist * 10 + adjacentEmptyBefore * 6)
                 : 0
+            let territoryFrontierScore = openingLikely ? 0 : territoryFrontierScore(
+                move: point,
+                stone: mover,
+                ownerBeforeMove: ownerBeforeMove,
+                ownersBeforeMove: ownersBeforeMove,
+                board: state.board,
+                capturesGained: capturesGained,
+                enemyAtariAfter: enemyAtariAfter,
+                ownAtariBefore: ownAtariBefore,
+                adjacentOwnBefore: adjacentOwnBefore,
+                adjacentEnemyBefore: adjacentEnemyBefore,
+                adjacentEmptyBefore: adjacentEmptyBefore
+            ) / 2
             let score =
                 capturesGained * 170 +
                 captureCompletionBonus +
                 openingExpansionBonus +
                 midgameCenterBonus +
+                territoryFrontierScore +
                 koTakeBonus +
                 koThreatBonus +
                 ownLiberties * 5 -
@@ -3066,6 +3325,7 @@ final class GoGameViewModel: ObservableObject {
                 ownEyeFillPenalty -
                 eyeRegressionPenalty -
                 openingContactPenalty -
+                openingOwnAdjacencyPenalty -
                 overconcentrationPenalty -
                 midgameEdgePenalty -
                 ownTerritoryFillPenalty -
@@ -3281,6 +3541,14 @@ final class GoGameViewModel: ObservableObject {
             let openingExpansionBonus = openingLikely
                 ? ((occupiedAdjacentBefore == 0 ? 70 : 0) + max(0, 2 - occupiedAdjacentBefore) * 16)
                 : 0
+            let openingOwnAdjacencyPenalty =
+                (openingLikely &&
+                 capturesGained == 0 &&
+                 adjacentEnemyBefore == 0 &&
+                 adjacentOwnBefore > 0 &&
+                 enemyAtariAfter == 0)
+                ? (80 + adjacentOwnBefore * 55)
+                : 0
             let midgameEdgePenalty: Int
             if midgameLikely && capturesGained == 0 && adjacentEnemyBefore == 0 && enemyAtariAfter == 0 {
                 if localEdgeDist == 0 {
@@ -3301,6 +3569,19 @@ final class GoGameViewModel: ObservableObject {
                  localEdgeDist >= 2)
                 ? (44 + localEdgeDist * 10 + adjacentEmptyBefore * 6)
                 : 0
+            let territoryFrontierScore = openingLikely ? 0 : territoryFrontierScoreFast(
+                moveIndex: pointIndex,
+                stone: mover,
+                ownerBeforeMove: ownerBeforeMove,
+                ownersBeforeMove: ownersBeforeMove,
+                board: state.board,
+                capturesGained: capturesGained,
+                enemyAtariAfter: enemyAtariAfter,
+                ownAtariBefore: ownAtariBefore,
+                adjacentOwnBefore: adjacentOwnBefore,
+                adjacentEnemyBefore: adjacentEnemyBefore,
+                adjacentEmptyBefore: adjacentEmptyBefore
+            ) / 2
             let openingSelfFillPenalty =
                 (openingLikely &&
                  capturesGained == 0 &&
@@ -3323,6 +3604,7 @@ final class GoGameViewModel: ObservableObject {
                 captureCompletionBonus +
                 openingExpansionBonus +
                 midgameCenterBonus +
+                territoryFrontierScore +
                 koTakeBonus +
                 koThreatBonus +
                 ownLiberties * 5 -
@@ -3330,6 +3612,7 @@ final class GoGameViewModel: ObservableObject {
                 ownEyeFillPenalty -
                 openingEdgePenalty -
                 openingSelfFillPenalty -
+                openingOwnAdjacencyPenalty -
                 deadShapePenalty -
                 eyeRegressionPenalty -
                 overconcentrationPenalty -
@@ -4348,11 +4631,18 @@ final class GoGameViewModel: ObservableObject {
                 : max(0, 65 - (localCornerDist * 11))
 
             // Encourage proper extension from own stones without over-concentrating.
-            let extensionTarget = boardSize <= 9 ? 3 : 4
-            let extensionBonus = ownStoneCount == 0
+            let extensionTarget = boardSize <= 9 ? 5 : 6
+            let extensionBonus = ownStoneCount == 0 || adjacentOwn > 0
                 ? 0
-                : max(0, 76 - abs(minOwnDist - extensionTarget) * 20)
-            let overconcentrationPenalty = ownStoneCount == 0 ? 0 : max(0, 3 - minOwnDist) * 42
+                : max(0, 96 - abs(minOwnDist - extensionTarget) * 16)
+            let spreadBonus = ownStoneCount == 0
+                ? 0
+                : min(150, max(0, minOwnDist - 2) * 42)
+            let overconcentrationPenalty = ownStoneCount == 0 ? 0 : max(0, 4 - minOwnDist) * 72
+            let earlyOwnAdjacencyPenalty =
+                (adjacentEnemy == 0 && adjacentOwn > 0)
+                ? (150 + adjacentOwn * 95)
+                : 0
 
             // Opening should avoid direct contact unless tactical pressure exists.
             let earlyContactPenalty = (adjacentEnemy > 0 && minEnemyDist <= 2) ? 42 : 0
@@ -4385,6 +4675,8 @@ final class GoGameViewModel: ObservableObject {
                 spaciousExpansionBonus +
                 josekiBonus +
                 extensionBonus -
+                earlyOwnAdjacencyPenalty +
+                spreadBonus -
                 overconcentrationPenalty -
                 contactPenalty -
                 earlyContactPenalty -
@@ -4476,11 +4768,18 @@ final class GoGameViewModel: ObservableObject {
             let earlyCornerBias = totalStones <= (size <= 9 ? 8 : 14)
                 ? max(0, 110 - (localCornerDist * 16))
                 : max(0, 65 - (localCornerDist * 11))
-            let extensionTarget = size <= 9 ? 3 : 4
-            let extensionBonus = ownStoneCount == 0
+            let extensionTarget = size <= 9 ? 5 : 6
+            let extensionBonus = ownStoneCount == 0 || adjacentOwn > 0
                 ? 0
-                : max(0, 76 - abs(minOwnDist - extensionTarget) * 20)
-            let overconcentrationPenalty = ownStoneCount == 0 ? 0 : max(0, 3 - minOwnDist) * 42
+                : max(0, 96 - abs(minOwnDist - extensionTarget) * 16)
+            let spreadBonus = ownStoneCount == 0
+                ? 0
+                : min(150, max(0, minOwnDist - 2) * 42)
+            let overconcentrationPenalty = ownStoneCount == 0 ? 0 : max(0, 4 - minOwnDist) * 72
+            let earlyOwnAdjacencyPenalty =
+                (adjacentEnemy == 0 && adjacentOwn > 0)
+                ? (150 + adjacentOwn * 95)
+                : 0
             let earlyContactPenalty = (adjacentEnemy > 0 && minEnemyDist <= 2) ? 42 : 0
             let centerPenalty = localEdgeDist >= preferredLine + 2
                 ? Int((Double(size) - distanceFromCenter).rounded()) * 12
@@ -4511,6 +4810,8 @@ final class GoGameViewModel: ObservableObject {
                 spaciousExpansionBonus +
                 josekiBonus +
                 extensionBonus -
+                earlyOwnAdjacencyPenalty +
+                spreadBonus -
                 overconcentrationPenalty -
                 contactPenalty -
                 earlyContactPenalty -
@@ -4685,6 +4986,7 @@ final class GoGameViewModel: ObservableObject {
         strategyGhostLastPublishUptime = 0
         strategyGhostLastCurrent = nil
         strategyGhostLastBest = nil
+        strategyGhostTrail = []
         strategyGhostPublishLock.unlock()
         strategyGhosts = []
     }
@@ -4694,6 +4996,7 @@ final class GoGameViewModel: ObservableObject {
         strategyGhostLastPublishUptime = 0
         strategyGhostLastCurrent = nil
         strategyGhostLastBest = nil
+        strategyGhostTrail = []
         strategyGhostPublishLock.unlock()
         strategyGhosts = []
     }
@@ -4795,6 +5098,7 @@ final class GoGameViewModel: ObservableObject {
                 moveIndex: pointIndex,
                 stone: mover,
                 ownerBeforeMove: ownersBeforeMove[pointIndex],
+                ownersBeforeMove: ownersBeforeMove,
                 endgameLikely: endgameLikely,
                 openingLikely: openingLikely,
                 afterFirstPass: afterFirstPass,
@@ -4866,6 +5170,7 @@ final class GoGameViewModel: ObservableObject {
                 move: point,
                 for: mover,
                 ownerBeforeMove: ownersBeforeMove[point.row][point.col],
+                ownersBeforeMove: ownersBeforeMove,
                 endgameLikely: endgameLikely,
                 openingLikely: openingLikely,
                 afterFirstPass: afterFirstPass,
@@ -4969,10 +5274,10 @@ final class GoGameViewModel: ObservableObject {
         return (response, followUp)
     }
 
-    private func shouldPublishStrategyGhosts(
+    private func strategyGhostPublishDecision(
         currentMove: (row: Int, col: Int),
         bestMove: (row: Int, col: Int)?
-    ) -> Bool {
+    ) -> (shouldPublish: Bool, trail: [(row: Int, col: Int)]) {
         let now = ProcessInfo.processInfo.systemUptime
         let minInterval: TimeInterval
         if isAIThinking {
@@ -5004,20 +5309,47 @@ final class GoGameViewModel: ObservableObject {
             strategyGhostLastBest?.row != bestMove?.row ||
             strategyGhostLastBest?.col != bestMove?.col
 
-        if !moveChanged {
-            return false
+        if moveChanged {
+            strategyGhostTrail.removeAll {
+                $0.row == currentMove.row && $0.col == currentMove.col
+            }
+            strategyGhostTrail.insert(currentMove, at: 0)
+            if strategyGhostTrail.count > 6 {
+                strategyGhostTrail.removeLast(strategyGhostTrail.count - 6)
+            }
         }
 
         let firstPublish = strategyGhostLastPublishUptime == 0
         let enoughTimeElapsed = (now - strategyGhostLastPublishUptime) >= minInterval
         guard firstPublish || enoughTimeElapsed else {
-            return false
+            return (false, strategyGhostTrail)
         }
 
         strategyGhostLastCurrent = currentMove
         strategyGhostLastBest = bestMove
         strategyGhostLastPublishUptime = now
-        return true
+        return (true, strategyGhostTrail)
+    }
+
+    private func appendStrategyTrailGhosts(
+        _ trail: [(row: Int, col: Int)],
+        to ghosts: inout [StrategyGhostStone],
+        stone: Stone
+    ) {
+        var occupied = Set(ghosts.map { "\($0.row)-\($0.col)" })
+        for (age, move) in trail.enumerated() {
+            let key = "\(move.row)-\(move.col)"
+            guard !occupied.contains(key) else { continue }
+            occupied.insert(key)
+            ghosts.append(
+                StrategyGhostStone(
+                    row: move.row,
+                    col: move.col,
+                    stone: stone,
+                    kind: .trail(age)
+                )
+            )
+        }
     }
 
     private func publishContemplatedMove(
@@ -5030,7 +5362,8 @@ final class GoGameViewModel: ObservableObject {
         guard showStrategyEnabled else { return }
         let current = (row: currentMove.row, col: currentMove.col)
         let bestTuple = bestMove.map { (row: $0.0, col: $0.1) }
-        guard shouldPublishStrategyGhosts(currentMove: current, bestMove: bestTuple) else { return }
+        let publishDecision = strategyGhostPublishDecision(currentMove: current, bestMove: bestTuple)
+        guard publishDecision.shouldPublish else { return }
         let preview = includePreviewLine
             ? previewStrategyLine(from: currentMove.stateAfterMove, aiStone: stone)
             : (opponentResponse: nil, aiFollowUp: nil)
@@ -5073,6 +5406,7 @@ final class GoGameViewModel: ObservableObject {
                 )
             )
         }
+        appendStrategyTrailGhosts(publishDecision.trail, to: &ghosts, stone: stone)
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             guard self.showStrategyEnabled else { return }
@@ -5091,7 +5425,8 @@ final class GoGameViewModel: ObservableObject {
         guard showStrategyEnabled else { return }
         let current = (row: currentMove.index / boardSize, col: currentMove.index % boardSize)
         let bestTuple = bestMoveIndex.map { (row: $0 / boardSize, col: $0 % boardSize) }
-        guard shouldPublishStrategyGhosts(currentMove: current, bestMove: bestTuple) else { return }
+        let publishDecision = strategyGhostPublishDecision(currentMove: current, bestMove: bestTuple)
+        guard publishDecision.shouldPublish else { return }
         let preview = includePreviewLine
             ? previewStrategyLineFast(from: currentMove.stateAfterMove, aiStone: stone)
             : (opponentResponse: nil, aiFollowUp: nil)
@@ -5134,6 +5469,7 @@ final class GoGameViewModel: ObservableObject {
                 )
             )
         }
+        appendStrategyTrailGhosts(publishDecision.trail, to: &ghosts, stone: stone)
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             guard self.showStrategyEnabled else { return }

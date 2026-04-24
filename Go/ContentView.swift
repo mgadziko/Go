@@ -230,6 +230,9 @@ private struct GoBoardView: View {
                             return ghost.stone == .black ? 0.44 : 0.56
                         case .aiFollowUp:
                             return ghost.stone == .black ? 0.28 : 0.36
+                        case .trail(let age):
+                            let base = ghost.stone == .black ? 0.22 : 0.30
+                            return max(0.10, base - (Double(age) * 0.035))
                         }
                     }()
                     let strokeColor: Color = {
@@ -242,6 +245,8 @@ private struct GoBoardView: View {
                             return Color.orange.opacity(0.9)
                         case .aiFollowUp:
                             return Color.cyan.opacity(0.9)
+                        case .trail:
+                            return Color.blue.opacity(0.35)
                         }
                     }()
                     let strokeWidth: CGFloat = {
@@ -254,12 +259,16 @@ private struct GoBoardView: View {
                             return 1.5
                         case .current:
                             return 1.2
+                        case .trail:
+                            return 0.9
                         }
                     }()
                     let sizeFactor: CGFloat = {
                         switch ghost.kind {
                         case .aiFollowUp:
                             return 0.72
+                        case .trail(let age):
+                            return max(0.46, 0.66 - CGFloat(age) * 0.035)
                         default:
                             return 0.78
                         }
