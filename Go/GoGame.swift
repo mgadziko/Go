@@ -91,6 +91,7 @@ private struct LearningTraceEntry: Codable {
     let stone: Stone
     let moveIndex: Int
     let wasAI: Bool
+    let localPatternKey: String?
 }
 
 private struct LearnedMoveStats: Codable {
@@ -152,6 +153,11 @@ private struct ImmediateCaptureKey: Hashable {
     let sampleLimit: Int
 }
 
+private struct AtariCountKey: Hashable {
+    let boardHash: UInt64
+    let stone: UInt8
+}
+
 private final class SearchEvalCache {
     private var staticScores: [StaticEvalKey: Double] = [:]
 
@@ -172,6 +178,8 @@ private final class RolloutThreadCache {
     var preferredEmptyByHash: [UInt64: [Int]] = [:]
     var openingLikelyByHash: [UInt64: Bool] = [:]
     var endgameLikelyByHash: [UInt64: Bool] = [:]
+    var territoryByHash: [UInt64: (black: Int, white: Int)] = [:]
+    var atariCountByKey: [AtariCountKey: Int] = [:]
     var immediateCaptureByKey: [ImmediateCaptureKey: Int] = [:]
     var visitMarks: [UInt32] = []
     var libertyMarks: [UInt32] = []
@@ -192,6 +200,12 @@ private final class RolloutThreadCache {
         }
         if endgameLikelyByHash.count > 1024 {
             endgameLikelyByHash.removeAll(keepingCapacity: true)
+        }
+        if territoryByHash.count > 1024 {
+            territoryByHash.removeAll(keepingCapacity: true)
+        }
+        if atariCountByKey.count > 2048 {
+            atariCountByKey.removeAll(keepingCapacity: true)
         }
         if immediateCaptureByKey.count > 2048 {
             immediateCaptureByKey.removeAll(keepingCapacity: true)
@@ -686,6 +700,8 @@ final class GoGameViewModel: ObservableObject {
             return false
         }
 
+        let localPatternKey = learningPatternKey(position: board, stone: mover, moveIndex: row * boardSize + col)
+
         board = next
         commitCurrentTurnTime(for: mover)
         if mover == .black {
@@ -706,7 +722,8 @@ final class GoGameViewModel: ObservableObject {
                 boardHashHex: encodeHashString(boardHashBeforeMove) ?? String(boardHashBeforeMove, radix: 16),
                 stone: mover,
                 moveIndex: row * boardSize + col,
-                wasAI: playerType(for: mover) == .ai
+                wasAI: playerType(for: mover) == .ai,
+                localPatternKey: localPatternKey
             )
         )
 
@@ -1798,6 +1815,11 @@ final class GoGameViewModel: ObservableObject {
             stoneCode: root.currentPlayer,
             moveIndex: moveIndex
         )
+        raw += learnedLocalPatternPolicyAdjustment(
+            board: root.board,
+            stoneCode: root.currentPlayer,
+            moveIndex: moveIndex
+        )
         return raw
     }
 
@@ -1853,10 +1875,16 @@ final class GoGameViewModel: ObservableObject {
             }
         }
         if endgameLikely && selfFillNoTactics { raw -= 2.2 }
+        let moveIndex = move.row * boardSize + move.col
         raw += learnedPolicyPriorAdjustment(
             boardHash: learningBoardHash,
             stone: root.currentPlayer,
-            moveIndex: move.row * boardSize + move.col
+            moveIndex: moveIndex
+        )
+        raw += learnedLocalPatternPolicyAdjustment(
+            position: root.board,
+            stone: root.currentPlayer,
+            moveIndex: moveIndex
         )
         return raw
     }
@@ -2542,12 +2570,12 @@ final class GoGameViewModel: ObservableObject {
         guard !replies.isEmpty else { return 22.0 }
 
         let replyLimit = tacticalModeEnabled ? min(9, replies.count) : min(5, replies.count)
+        let rolloutCache = tacticalModeEnabled ? threadLocalRolloutCache() : nil
         var worst = Double.greatestFiniteMagnitude
         for reply in replies.prefix(replyLimit) {
             let replyScore = staticBoardScoreFast(for: perspective, in: reply.stateAfterMove, cache: cache)
             let effectiveScore: Double
-            if tacticalModeEnabled {
-                let rolloutCache = threadLocalRolloutCache()
+            if tacticalModeEnabled, let rolloutCache {
                 let counterScore = bestLocalCounterScoreFast(
                     for: perspective,
                     in: reply.stateAfterMove,
@@ -2582,13 +2610,19 @@ final class GoGameViewModel: ObservableObject {
             return cached
         }
 
-        let (blackTerritory, whiteTerritory) = territory(onFastBoard: state.board)
+        let boardHash = state.currentBoardHash ?? hash(forFastBoard: state.board)
+        let rolloutCache = threadLocalRolloutCache()
+        let (blackTerritory, whiteTerritory) = territoryFastCached(
+            on: state.board,
+            boardHash: boardHash,
+            cache: rolloutCache
+        )
         let blackScore = Double(blackTerritory + state.capturesBlack)
         let whiteScore = Double(whiteTerritory + state.capturesWhite) + whiteKomi
         let balance = perspective == 1 ? (blackScore - whiteScore) : (whiteScore - blackScore)
 
-        let ownAtari = countGroupsInAtariFast(for: perspective, in: state.board)
-        let oppAtari = countGroupsInAtariFast(for: perspective == 1 ? 2 : 1, in: state.board)
+        let ownAtari = countGroupsInAtariFast(for: perspective, in: state.board, boardHash: boardHash, cache: rolloutCache)
+        let oppAtari = countGroupsInAtariFast(for: perspective == 1 ? 2 : 1, in: state.board, boardHash: boardHash, cache: rolloutCache)
         let safetyDelta = Double((oppAtari * 9) - (ownAtari * 14))
         let score = balance + safetyDelta
         cache.store(score, for: key)
@@ -3136,14 +3170,12 @@ final class GoGameViewModel: ObservableObject {
             steps += 1
         }
 
-        let (blackTerritory, whiteTerritory) = territory(onFastBoard: sim.board)
-        let blackScore = Double(blackTerritory + sim.capturesBlack)
-        let whiteScore = Double(whiteTerritory + sim.capturesWhite) + whiteKomi
-
-        if perspective == .black {
-            return blackScore - whiteScore
-        }
-        return whiteScore - blackScore
+        return rolloutTerminalScoreFast(
+            for: perspective,
+            in: sim,
+            endedNaturally: sim.consecutivePasses >= 2,
+            cache: rolloutCache
+        )
     }
 
     private func runRandomPlayoutBatchFast(
@@ -3422,6 +3454,25 @@ final class GoGameViewModel: ObservableObject {
         var topPool: [(index: Int, score: Int)] = []
         let scanLimit = min(points.count, boardSize <= 9 ? 80 : 52)
         let poolLimit = 8
+
+        func insertTopPool(_ entry: (index: Int, score: Int)) {
+            if topPool.isEmpty {
+                topPool.append(entry)
+                return
+            }
+            var inserted = false
+            for i in topPool.indices where entry.score > topPool[i].score {
+                topPool.insert(entry, at: i)
+                inserted = true
+                break
+            }
+            if !inserted && topPool.count < poolLimit {
+                topPool.append(entry)
+            }
+            if topPool.count > poolLimit {
+                topPool.removeLast()
+            }
+        }
         let endgameLikely = isLikelyEndgameFast(state: state)
         let openingLikely = isLikelyOpeningFast(state: state)
         let midgameLikely = !openingLikely && !endgameLikely
@@ -3582,6 +3633,24 @@ final class GoGameViewModel: ObservableObject {
                 adjacentEnemyBefore: adjacentEnemyBefore,
                 adjacentEmptyBefore: adjacentEmptyBefore
             ) / 2
+            let urgentDefenseBonus = ownAtariBefore > 0
+                ? min(360, 105 + (ownAtariBefore * 75) + max(0, ownLiberties - 1) * 12)
+                : 0
+            let boundaryReductionBonus: Int
+            if !openingLikely && capturesGained == 0 && enemyAtariAfter == 0 {
+                let opponent: UInt8 = mover == 1 ? 2 : 1
+                let opponentOwnedAdjacent = neighborIndexTable[pointIndex].reduce(into: 0) { total, n in
+                    if state.board[n] == 0 && ownersBeforeMove[n] == opponent { total += 1 }
+                }
+                let contestedAdjacent = neighborIndexTable[pointIndex].reduce(into: 0) { total, n in
+                    if state.board[n] == 0 && ownersBeforeMove[n] == 0 { total += 1 }
+                }
+                boundaryReductionBonus = (ownerBeforeMove == 0 || ownerBeforeMove == opponent)
+                    ? min(220, opponentOwnedAdjacent * 45 + contestedAdjacent * 28 + adjacentOwnBefore * 18)
+                    : 0
+            } else {
+                boundaryReductionBonus = 0
+            }
             let openingSelfFillPenalty =
                 (openingLikely &&
                  capturesGained == 0 &&
@@ -3599,12 +3668,18 @@ final class GoGameViewModel: ObservableObject {
                 enemyAtariAfter: enemyAtariAfter,
                 cache: cache
             )
+            let quietOwnTerritoryPenalty =
+                (selfFillNoTactics && adjacentEnemyBefore == 0 && enemyAtariAfter == 0 && ownAtariBefore == 0)
+                ? (endgameLikely ? 520 : 180)
+                : 0
             let score =
                 capturesGained * 170 +
                 captureCompletionBonus +
                 openingExpansionBonus +
                 midgameCenterBonus +
                 territoryFrontierScore +
+                urgentDefenseBonus +
+                boundaryReductionBonus +
                 koTakeBonus +
                 koThreatBonus +
                 ownLiberties * 5 -
@@ -3618,16 +3693,13 @@ final class GoGameViewModel: ObservableObject {
                 overconcentrationPenalty -
                 midgameEdgePenalty -
                 ownTerritoryFillPenalty -
+                quietOwnTerritoryPenalty -
                 koTakePenalty -
                 koIgnorePenalty -
                 thinPenalty +
                 eyeProgressBonus +
                 Int.random(in: 0...6)
-            topPool.append((pointIndex, score))
-            topPool.sort { $0.score > $1.score }
-            if topPool.count > poolLimit {
-                topPool.removeLast()
-            }
+            insertTopPool((pointIndex, score))
         }
 
         guard !topPool.isEmpty else { return nil }
@@ -4417,7 +4489,11 @@ final class GoGameViewModel: ObservableObject {
             JosekiRule(requiredOwn: [], requiredOpp: [(p, near)], suggestions: [(p, q), (q, near)]),
             // Basic continuation when both sides have established local contact.
             JosekiRule(requiredOwn: [(q, p)], requiredOpp: [(p, p)], suggestions: [(far, p), (q, p + 1)]),
-            JosekiRule(requiredOwn: [(p, q)], requiredOpp: [(p, p)], suggestions: [(p, far), (p + 1, q)])
+            JosekiRule(requiredOwn: [(p, q)], requiredOpp: [(p, p)], suggestions: [(p, far), (p + 1, q)]),
+            // Broad framework extensions: prefer side/corner growth over local clumping.
+            JosekiRule(requiredOwn: [(p, p)], requiredOpp: [], suggestions: [(far, p), (p, far), (q, q)]),
+            JosekiRule(requiredOwn: [(q, p)], requiredOpp: [], suggestions: [(far, p), (q, q)]),
+            JosekiRule(requiredOwn: [(p, q)], requiredOpp: [], suggestions: [(p, far), (q, q)])
         ]
     }
 
@@ -5537,6 +5613,153 @@ final class GoGameViewModel: ObservableObject {
         return learnedPolicyPriorAdjustment(boardHash: boardHash, stone: stone, moveIndex: moveIndex)
     }
 
+    private func territoryFastCached(
+        on board: [UInt8],
+        boardHash: UInt64,
+        cache: RolloutThreadCache
+    ) -> (black: Int, white: Int) {
+        if let cached = cache.territoryByHash[boardHash] {
+            return cached
+        }
+        let computed = territory(onFastBoard: board)
+        cache.territoryByHash[boardHash] = computed
+        return computed
+    }
+
+    private func countGroupsInAtariFast(
+        for stone: UInt8,
+        in board: [UInt8],
+        boardHash: UInt64,
+        cache: RolloutThreadCache
+    ) -> Int {
+        let key = AtariCountKey(boardHash: boardHash, stone: stone)
+        if let cached = cache.atariCountByKey[key] {
+            return cached
+        }
+        let computed = countGroupsInAtariFast(for: stone, in: board)
+        cache.atariCountByKey[key] = computed
+        return computed
+    }
+
+    private func rolloutTerminalScoreFast(
+        for perspective: Stone,
+        in state: FastSimState,
+        endedNaturally: Bool,
+        cache: RolloutThreadCache
+    ) -> Double {
+        let boardHash = state.currentBoardHash ?? hash(forFastBoard: state.board)
+        let useExactTerritory = endedNaturally || (boardHash & 0b11) == 0
+        let blackScore: Double
+        let whiteScore: Double
+
+        if useExactTerritory {
+            let territory = territoryFastCached(on: state.board, boardHash: boardHash, cache: cache)
+            blackScore = Double(territory.black + state.capturesBlack)
+            whiteScore = Double(territory.white + state.capturesWhite) + whiteKomi
+        } else {
+            let estimate = cheapInfluenceScoreFast(in: state.board)
+            blackScore = estimate.black + Double(state.capturesBlack)
+            whiteScore = estimate.white + Double(state.capturesWhite) + whiteKomi
+        }
+
+        return perspective == .black ? (blackScore - whiteScore) : (whiteScore - blackScore)
+    }
+
+    private func cheapInfluenceScoreFast(in board: [UInt8]) -> (black: Double, white: Double) {
+        var black = 0.0
+        var white = 0.0
+
+        for index in board.indices {
+            switch board[index] {
+            case 1:
+                black += 0.45
+            case 2:
+                white += 0.45
+            default:
+                var blackNeighbors = 0
+                var whiteNeighbors = 0
+                for neighbor in neighborIndexTable[index] {
+                    if board[neighbor] == 1 {
+                        blackNeighbors += 1
+                    } else if board[neighbor] == 2 {
+                        whiteNeighbors += 1
+                    }
+                }
+                if blackNeighbors > whiteNeighbors {
+                    black += 0.72 + Double(blackNeighbors - whiteNeighbors) * 0.08
+                } else if whiteNeighbors > blackNeighbors {
+                    white += 0.72 + Double(whiteNeighbors - blackNeighbors) * 0.08
+                }
+            }
+        }
+
+        return (black, white)
+    }
+
+    private func learningPatternKey(position: [[Stone]], stone: Stone, moveIndex: Int) -> String {
+        learningPatternKey(board: flattenBoard(position), stoneCode: stoneCode(for: stone), moveIndex: moveIndex)
+    }
+
+    private func learningPatternKey(board: [UInt8], stoneCode: UInt8, moveIndex: Int) -> String {
+        let row = moveIndex / boardSize
+        let col = moveIndex % boardSize
+        let edgeBand = min(min(row, boardSize - 1 - row), min(col, boardSize - 1 - col), 4)
+        var parts: [String] = []
+        parts.reserveCapacity(25)
+        let opponent: UInt8 = stoneCode == 1 ? 2 : 1
+
+        for dr in -2...2 {
+            for dc in -2...2 {
+                let r = row + dr
+                let c = col + dc
+                guard r >= 0, c >= 0, r < boardSize, c < boardSize else {
+                    parts.append("#")
+                    continue
+                }
+                let value = board[(r * boardSize) + c]
+                if value == 0 {
+                    parts.append(".")
+                } else if value == stoneCode {
+                    parts.append("X")
+                } else if value == opponent {
+                    parts.append("O")
+                } else {
+                    parts.append("?")
+                }
+            }
+        }
+
+        let stoneLabel = stoneCode == 1 ? "B" : "W"
+        return "P|\(boardSize)|\(stoneLabel)|E\(edgeBand)|\(parts.joined())"
+    }
+
+    private func learnedLocalPatternPolicyAdjustment(board: [UInt8], stoneCode: UInt8, moveIndex: Int) -> Double {
+        guard stoneCode == 1 || stoneCode == 2 else { return 0 }
+        let key = learningPatternKey(board: board, stoneCode: stoneCode, moveIndex: moveIndex)
+        learningLock.lock()
+        let stats = learningBook.moveStats[key]
+        learningLock.unlock()
+        guard let stats, stats.plays >= 3 else { return 0 }
+        let winRate = stats.wins / Double(stats.plays)
+        let confidence = min(1.0, log1p(Double(stats.plays)) / 6.0)
+        return (winRate - 0.5) * 1.6 * confidence
+    }
+
+    private func learnedLocalPatternPolicyAdjustment(position: [[Stone]], stone: Stone, moveIndex: Int) -> Double {
+        learnedLocalPatternPolicyAdjustment(board: flattenBoard(position), stoneCode: stoneCode(for: stone), moveIndex: moveIndex)
+    }
+
+    private func applyLearningResult(to key: String, stone: Stone, winner: Stone?) {
+        var stats = learningBook.moveStats[key] ?? LearnedMoveStats(plays: 0, wins: 0)
+        stats.plays += 1
+        if let winner {
+            if winner == stone { stats.wins += 1.0 }
+        } else {
+            stats.wins += 0.5
+        }
+        learningBook.moveStats[key] = stats
+    }
+
     private func loadLearningBook() {
         do {
             let url = try learningFileURL()
@@ -5580,14 +5803,10 @@ final class GoGameViewModel: ObservableObject {
         for entry in relevant {
             guard let boardHash = decodeHashString(entry.boardHashHex) else { continue }
             let key = learningKey(boardHash: boardHash, stone: entry.stone, moveIndex: entry.moveIndex)
-            var stats = learningBook.moveStats[key] ?? LearnedMoveStats(plays: 0, wins: 0)
-            stats.plays += 1
-            if let winner {
-                if winner == entry.stone { stats.wins += 1.0 }
-            } else {
-                stats.wins += 0.5
+            applyLearningResult(to: key, stone: entry.stone, winner: winner)
+            if let localPatternKey = entry.localPatternKey {
+                applyLearningResult(to: localPatternKey, stone: entry.stone, winner: winner)
             }
-            learningBook.moveStats[key] = stats
         }
 
         if learningBook.moveStats.count > learningMaxEntries {
